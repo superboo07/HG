@@ -1,0 +1,54 @@
+schema_version = 1
+
+[game]
+id = "SLUS-21075-v1.01"
+title = "Haunting Ground"
+serial = "SLUS_210.75"
+region = "USA"
+version = "1.01"
+video_mode = "NTSC"
+elf_sha256 = "3b374d53a499d2c17b205274ee9eb34280768f294f970ebf6ae6731f6a2dacb8"
+iso_sha256 = "3f8c658eee1b35147672c597c0dbe8e36552172abf83571c52753eec9a50bcca"
+
+[layout]
+# The final reviewed static-initializer function ends here and the monotonic
+# initializer pointer table begins at this same address.
+file_backed_data_start = 0x00469460
+evidence = "The generic startup loop consumes the 143-entry pointer table at 0x00469460-0x0046969C; its last target is 0x00469400 and that function's reviewed exclusive end is 0x00469460."
+
+[recompiler]
+single_file_output = false
+low_memory_mode = true
+output_worker_threads = 0
+patch_syscalls = false
+patch_cop0 = true
+patch_cache = true
+# ElfAnalyzer's initial scan treated these data ranges as enormous functions.
+# The reviewed standalone map supplies real boundaries independently; suppress
+# only the legacy analyzer-generated names in PS2Recomp's internal list.
+exclude_analyzer_functions = [
+  "sub_00146130",
+  "sub_00188C10",
+  "sub_003A1860",
+  "sub_003C4854",
+  "sub_00405060",
+  "sub_00446890",
+]
+# ElfAnalyzer misclassified the game's libkernel InitThread helper as the
+# same-named runtime syscall. The guest helper creates the idle thread and sets
+# the main EE thread to priority 1; replacing it leaves subsequent engine
+# event-thread priorities at zero and makes CreateThread reject them.
+exclude_base_stubs = [
+  "InitThread@0x0026CF78",
+]
+# ElfAnalyzer also proposed NOPing two ordinary stores that are required by the
+# verified U.S. executable. The PCSX2 oracle executes 0x001CBE18 and retains the
+# current main-thread priority (1) at 0x003BFBF8. Exact ELF bytes and the live
+# movie-construction trace prove that 0x00259F20 is `sw v1, 4(s0)`: it writes
+# the MPEG object-pool capacity (8) after the preceding memset. Removing that
+# store leaves 0x003EA2A4 zero, so 0x0025A0D0 reports no free decoder slot and
+# OPENING.SFD construction fails before sceMpegCreate can run.
+exclude_base_patches = [
+  0x001CBE18,
+  0x00259F20,
+]

@@ -1,0 +1,57 @@
+# User-supplied copyrighted/proprietary inputs and oracle runtime
+/emu/
+/Haunting Ground (USA)/
+
+# Temporary visual artifacts may only live here and remain untracked
+/UNEEDED images/*
+!/UNEEDED images/.gitkeep
+
+# Generated/recompiled output, traces, captures, and local configuration
+/build/
+/out/
+/generated/
+/traces/
+/captures/
+/2000
+/imgui.ini
+/ps2_log.txt
+*.iso
+*.bin
+*.elf
+*.irx
+*.cvm
+*.ps2
+*.mcd
+*.p2s
+*.dump
+*.trace
+
+# CMake and compiler output
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Editors and operating systems
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local-only path/settings overrides
+config/local.toml
+config/*.local.toml
+CMakeUserPresets.json
+
+# Python caches
+__pycache__/
+*.py[cod]
