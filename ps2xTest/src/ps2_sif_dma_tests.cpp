@@ -221,8 +221,13 @@ void register_ps2_sif_dma_tests()
             setRegU32(env.ctx, 4, kIopBlockSize);
             ps2_stubs::sceSifAllocIopHeap(env.rdram.data(), &env.ctx, &env.runtime);
             const uint32_t iopAddress = ::getRegU32(&env.ctx, 2);
-            t.IsTrue(iopAddress >= PS2_RAM_SIZE,
-                     "sceSifAllocIopHeap should return an address outside EE RDRAM");
+            t.Equals(iopAddress, 0x00070E00u,
+                     "sceSifAllocIopHeap should return the first real IOP heap address");
+
+            std::array<uint8_t, 32> numericEeSentinel{};
+            numericEeSentinel.fill(0xA5u);
+            std::memcpy(env.rdram.data() + iopAddress,
+                        numericEeSentinel.data(), numericEeSentinel.size());
 
             Ps2SifDmaTransfer desc{
                 kSrcAddr,
@@ -244,6 +249,9 @@ void register_ps2_sif_dma_tests()
             t.IsTrue(std::memcmp(env.rdram.data() + kFormerAliasAddr,
                                  aliasSentinel.data(), aliasSentinel.size()) == 0,
                      "IOP DMA must not overwrite the old 0x01A00000 EE alias range");
+            t.IsTrue(std::memcmp(env.rdram.data() + iopAddress,
+                                 numericEeSentinel.data(), numericEeSentinel.size()) == 0,
+                     "private IOP storage must not alias the equal numeric EE address");
 
             PS2IopHostAdapter host(env.runtime);
             auto scope = host.enterCall(&env.ctx, env.rdram.data());

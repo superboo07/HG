@@ -2,12 +2,14 @@
 
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
+#include "Kernel/Stubs/CD.h"
 #include "Kernel/Stubs/SIF.h"
 #include "runtime/ps2_memory.h"
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Syscalls/Common.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -259,7 +261,91 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
                                             sendPointer,
                                             send.size,
                                             receivePointer,
-                                            receive.size);
+                                             receive.size);
+}
+
+bool PS2IopHostAdapter::writeSpu2(uint32_t address, const void *source, size_t size)
+{
+    if ((!source && size != 0u) || address > kSpu2RamBytes ||
+        size > kSpu2RamBytes - address)
+    {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(m_spu2Mutex);
+    if (size != 0u)
+    {
+        std::memcpy(m_spu2Ram.data() + address, source, size);
+    }
+    return true;
+}
+
+uint32_t PS2IopHostAdapter::submitSpu2StereoStream(uint32_t firstCursor,
+                                                   uint32_t secondCursor,
+                                                   uint32_t bytesPerChannel,
+                                                   uint32_t firstRingBase,
+                                                   uint32_t secondRingBase,
+                                                   uint32_t ringBytes,
+                                                   uint32_t sampleRate)
+{
+    if (bytesPerChannel == 0u || ringBytes == 0u || sampleRate == 0u ||
+        bytesPerChannel > ringBytes ||
+        firstRingBase > std::numeric_limits<uint32_t>::max() - ringBytes ||
+        secondRingBase > std::numeric_limits<uint32_t>::max() - ringBytes ||
+        firstCursor < firstRingBase || firstCursor >= firstRingBase + ringBytes ||
+        secondCursor < secondRingBase || secondCursor >= secondRingBase + ringBytes)
+    {
+        return 0u;
+    }
+
+    std::vector<uint8_t> first(bytesPerChannel);
+    std::vector<uint8_t> second(bytesPerChannel);
+    const auto copyRing = [&](uint32_t cursor,
+                              uint32_t ringBase,
+                              std::vector<uint8_t> &destination) -> bool
+    {
+        const uint32_t contiguous = std::min(bytesPerChannel,
+                                             ringBase + ringBytes - cursor);
+        if (!readGuest(cursor, destination.data(), contiguous))
+            return false;
+        if (contiguous != bytesPerChannel)
+        {
+            if (!readGuest(ringBase,
+                           destination.data() + contiguous,
+                           bytesPerChannel - contiguous))
+                return false;
+        }
+        return true;
+    };
+    // The SNDDRV refill cursors refer to the IOP transfer rings mirrored by the
+    // SIF HLE into guest-visible memory. They are not SPU2 sample-RAM offsets.
+    if (!copyRing(firstCursor, firstRingBase, first) ||
+        !copyRing(secondCursor, secondRingBase, second))
+        return 0u;
+
+    const uint64_t streamKey = (static_cast<uint64_t>(firstRingBase) << 32u) |
+                               secondRingBase;
+    m_runtime.audioBackend().onSnddrvPcm16Stereo(first.data(),
+                                                 second.data(),
+                                                 bytesPerChannel,
+                                                 sampleRate,
+                                                 streamKey);
+
+    const uint64_t frames = bytesPerChannel / sizeof(int16_t);
+    return static_cast<uint32_t>(std::min<uint64_t>(
+        (frames * 1000000u + sampleRate - 1u) / sampleRate,
+        std::numeric_limits<uint32_t>::max()));
+}
+
+bool PS2IopHostAdapter::scheduleHostCallback(uint32_t delayMicroseconds,
+                                             std::function<void()> callback)
+{
+    if (!callback)
+    {
+        return false;
+    }
+    m_runtime.eeScheduler().scheduleHostCallback(
+        std::chrono::microseconds(delayMicroseconds), std::move(callback));
+    return true;
 }
 
 std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
@@ -395,6 +481,13 @@ void PS2IopHostAdapter::closeHostFile(uint64_t handle)
     }
 }
 
+bool PS2IopHostAdapter::registerCdFile(std::string_view path,
+                                       uint32_t lsn,
+                                       uint32_t size)
+{
+    return ps2_stubs::registerCdFileMapping(path, lsn, size);
+}
+
 int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &request)
 {
     using Handler = void (*)(uint8_t *, R5900Context *, PS2Runtime *);
@@ -458,8 +551,9 @@ int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &reques
         setRegU32(&context, static_cast<int>(4 + i), request.arguments[i]);
     }
 
-    // EE n32 ABI: the fifth argument travels in $t0, matching the sceMc* stubs.
+    // EE n32 ABI: the fifth and sixth arguments travel in $t0/$t1.
     setRegU32(&context, 8, request.arguments[4]);
+    setRegU32(&context, 9, request.arguments[5]);
 
     handler(m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM(),
             &context,

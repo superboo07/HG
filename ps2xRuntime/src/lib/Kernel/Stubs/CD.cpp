@@ -10,6 +10,8 @@ namespace ps2_stubs
         constexpr uint32_t kCdStreamBlocking = 1u;
         constexpr uint32_t kDvdSectorsPerSecondX1 = 675u;
         constexpr uint32_t kDvdSectorsPerSecondX4 = kDvdSectorsPerSecondX1 * 4u;
+        constexpr uint32_t kCdReadWaitType = 0x43445244u; // 'CDRD'
+        constexpr uint32_t kMinimumCdReadDelayMicroseconds = 1000u;
         constexpr uint64_t kNtScFieldsPerSecondNumerator = 60000u;
         constexpr uint64_t kNtScFieldsPerSecondDenominator = 1001u;
 
@@ -30,6 +32,211 @@ namespace ps2_stubs
 
         uint32_t g_cdStReadTraceCount = 0u;
         CdStreamTimingState g_cdStreamTiming;
+        uint32_t g_cdCallbackAddress = 0u;
+        uint32_t g_cdCallbackGp = 0u;
+
+        struct CdPendingReadState
+        {
+            bool busy = false;
+            uint64_t token = 0u;
+            uint32_t lbn = 0u;
+            uint32_t sectors = 0u;
+            uint32_t destination = 0u;
+            size_t bytes = 0u;
+        };
+
+        CdPendingReadState g_cdPendingRead;
+        uint64_t g_cdReadGeneration = 0u;
+
+        struct CdResolvedReadSource
+        {
+            std::filesystem::path path;
+            uint64_t offset = 0u;
+            size_t bytes = 0u;
+        };
+
+        struct CdAsyncReadOperation
+        {
+            std::atomic<bool> completed{false};
+            bool succeeded = false;
+            std::vector<uint8_t> data;
+        };
+
+        bool resolveCdReadSource(uint32_t lbn,
+                                 uint32_t sectors,
+                                 size_t byteCount,
+                                 CdResolvedReadSource &source)
+        {
+            for (const auto &[key, entry] : g_cdFilesByKey)
+            {
+                (void)key;
+                const uint64_t endLbn = static_cast<uint64_t>(entry.baseLbn) + entry.sectors;
+                const uint64_t readEndLbn = static_cast<uint64_t>(lbn) + sectors;
+                if (lbn < entry.baseLbn || static_cast<uint64_t>(lbn) >= endLbn)
+                {
+                    continue;
+                }
+                if (readEndLbn > endLbn)
+                {
+                    return false;
+                }
+
+                source.path = entry.hostPath;
+                source.offset = static_cast<uint64_t>(lbn - entry.baseLbn) * kCdSectorSize;
+                source.bytes = byteCount;
+                return true;
+            }
+
+            const std::filesystem::path cdImage = getCdImagePath();
+            if (cdImage.empty())
+            {
+                return false;
+            }
+
+            uint64_t totalSectors = 0u;
+            if (tryGetCdImageTotalSectors(totalSectors))
+            {
+                const uint64_t start = lbn;
+                const uint64_t end = start + sectors;
+                if (start >= totalSectors || end > totalSectors)
+                {
+                    return false;
+                }
+            }
+
+            source.path = cdImage;
+            source.offset = static_cast<uint64_t>(lbn) * kCdSectorSize;
+            source.bytes = byteCount;
+            return true;
+        }
+
+        bool readResolvedCdSource(const CdResolvedReadSource &source,
+                                  std::vector<uint8_t> &data)
+        {
+            data.assign(source.bytes, 0u);
+            if (source.bytes == 0u)
+            {
+                return true;
+            }
+
+            std::ifstream input(source.path, std::ios::binary);
+            if (!input.is_open())
+            {
+                data.clear();
+                return false;
+            }
+            input.seekg(static_cast<std::streamoff>(source.offset), std::ios::beg);
+            if (!input.good())
+            {
+                data.clear();
+                return false;
+            }
+            input.read(reinterpret_cast<char *>(data.data()),
+                       static_cast<std::streamsize>(data.size()));
+            if (input.gcount() != static_cast<std::streamsize>(data.size()))
+            {
+                data.clear();
+                return false;
+            }
+            return true;
+        }
+
+        uint32_t cdReadDelayMicroseconds(uint32_t sectors)
+        {
+            const uint64_t transfer =
+                (static_cast<uint64_t>(sectors) * 1000000u + kDvdSectorsPerSecondX4 - 1u) /
+                kDvdSectorsPerSecondX4;
+            return static_cast<uint32_t>(std::min<uint64_t>(
+                std::numeric_limits<uint32_t>::max(),
+                std::max<uint64_t>(kMinimumCdReadDelayMicroseconds, transfer)));
+        }
+
+        void queueCdCallback(PS2Runtime *runtime, const R5900Context &parent, uint32_t reason)
+        {
+            if (!runtime || g_cdCallbackAddress == 0u)
+            {
+                return;
+            }
+
+            uint32_t callbackAddress = g_cdCallbackAddress;
+            if (!runtime->hasFunction(callbackAddress) && callbackAddress >= 0x10000u &&
+                runtime->hasFunction(callbackAddress - 0x10000u))
+            {
+                callbackAddress -= 0x10000u;
+            }
+            if (!runtime->hasFunction(callbackAddress))
+            {
+                RUNTIME_LOG("[sceCdCallback:missing] address=0x" << std::hex << g_cdCallbackAddress << std::dec << std::endl);
+                return;
+            }
+
+            GuestInvocation callback{};
+            callback.kind = GuestInvocationKind::HleCall;
+            callback.tag = reason;
+            callback.context = parent;
+            callback.context.pc = callbackAddress;
+            SET_GPR_U32(&callback.context, 4, reason);
+            SET_GPR_U32(&callback.context, 28, g_cdCallbackGp);
+            SET_GPR_U32(&callback.context, 29, runtime->eeScheduler().invocationStackTop());
+            SET_GPR_U32(&callback.context, 31, 0u);
+            runtime->eeScheduler().queueInvocation(std::move(callback));
+        }
+
+        void publishAsyncCdRead(PS2Runtime *runtime,
+                                uint8_t *rdram,
+                                std::shared_ptr<CdAsyncReadOperation> operation,
+                                R5900Context callbackContext,
+                                uint64_t token,
+                                uint32_t lbn,
+                                uint32_t sectors,
+                                uint32_t destination)
+        {
+            if (!g_cdPendingRead.busy || g_cdPendingRead.token != token)
+            {
+                return;
+            }
+            if (!operation->completed.load(std::memory_order_acquire))
+            {
+                runtime->eeScheduler().scheduleHostCallback(
+                    std::chrono::microseconds(250u),
+                    [runtime, rdram, operation, callbackContext, token, lbn, sectors, destination]() mutable
+                    {
+                        publishAsyncCdRead(runtime,
+                                           rdram,
+                                           std::move(operation),
+                                           callbackContext,
+                                           token,
+                                           lbn,
+                                           sectors,
+                                           destination);
+                    });
+                return;
+            }
+
+            if (operation->succeeded)
+            {
+                if (!operation->data.empty())
+                {
+                    std::memcpy(rdram + destination,
+                                operation->data.data(),
+                                operation->data.size());
+                }
+                g_cdStreamingLbn = lbn + sectors;
+                g_lastCdError = 0;
+            }
+            else
+            {
+                if (g_cdPendingRead.bytes != 0u)
+                {
+                    std::memset(rdram + destination, 0, g_cdPendingRead.bytes);
+                }
+                g_lastCdError = 0x30; // SCECdErREAD
+            }
+
+            g_cdPendingRead.busy = false;
+            runtime->eeScheduler().completeExternalWait(kCdReadWaitType, token, 0);
+            queueCdCallback(runtime, callbackContext, 1u); // SCECdFuncRead
+        }
 
         uint64_t currentCdStreamTick(PS2Runtime *runtime)
         {
@@ -175,6 +382,12 @@ namespace ps2_stubs
         snapshot.initialized = g_cdInitialized;
         snapshot.lastError = g_lastCdError;
         snapshot.mode = g_cdMode;
+        snapshot.readBusy = g_cdPendingRead.busy;
+        snapshot.readToken = g_cdPendingRead.token;
+        snapshot.readLbn = g_cdPendingRead.lbn;
+        snapshot.readSectors = g_cdPendingRead.sectors;
+        snapshot.readDestination = g_cdPendingRead.destination;
+        snapshot.readBytes = g_cdPendingRead.bytes;
         snapshot.streamingLbn = g_cdStreamingLbn;
         snapshot.streamingEndLbn = g_cdStreamingEndLbn;
         snapshot.nextPseudoLbn = g_nextPseudoLbn;
@@ -204,11 +417,34 @@ namespace ps2_stubs
         return snapshot;
     }
 
+    bool registerCdFileMapping(std::string_view ps2Path,
+                               uint32_t baseLbn,
+                               uint32_t expectedSize)
+    {
+        return registerCdFileAtDiscLbn(std::string(ps2Path), baseLbn, expectedSize);
+    }
+
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t a0 = getRegU32(ctx, 4); // usually lbn
         const uint32_t a1 = getRegU32(ctx, 5); // usually sector count
         const uint32_t a2 = getRegU32(ctx, 6); // usually destination buffer
+        if (runtime != nullptr && g_cdPendingRead.busy)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        static uint32_t readLogCount = 0;
+        if (readLogCount < 128u || a1 > 1u)
+        {
+            RUNTIME_LOG("[sceCdRead:CALL] pc=0x" << std::hex << ctx->pc
+                                                 << " ra=0x" << getRegU32(ctx, 31)
+                                                 << " a0=0x" << a0
+                                                 << " a1=0x" << a1
+                                                 << " a2=0x" << a2
+                                                 << std::dec << std::endl);
+            ++readLogCount;
+        }
 
         struct CdReadArgs
         {
@@ -231,20 +467,137 @@ namespace ps2_stubs
             return static_cast<size_t>(clamped);
         };
 
-        auto tryRead = [&](const CdReadArgs &args) -> bool
+        if (runtime != nullptr)
+        {
+            CdReadArgs selected{a0, a1, a2, "a0/a1/a2"};
+            CdResolvedReadSource source{};
+            size_t selectedBytes = clampReadBytes(selected.sectors,
+                                                  selected.buf & PS2_RAM_MASK);
+            bool resolved = resolveCdReadSource(selected.lbn,
+                                                selected.sectors,
+                                                selectedBytes,
+                                                source);
+            if (!resolved && !isResolvableCdLbn(selected.lbn))
+            {
+                constexpr uint32_t kMaxReasonableSectors = PS2_RAM_SIZE / kCdSectorSize;
+                const std::array<CdReadArgs, 5> alternatives = {
+                    CdReadArgs{a2, a1, a0, "a2/a1/a0"},
+                    CdReadArgs{a0, a2, a1, "a0/a2/a1"},
+                    CdReadArgs{a1, a0, a2, "a1/a0/a2"},
+                    CdReadArgs{a1, a2, a0, "a1/a2/a0"},
+                    CdReadArgs{a2, a0, a1, "a2/a0/a1"}};
+                for (const CdReadArgs &candidate : alternatives)
+                {
+                    if (candidate.sectors > kMaxReasonableSectors ||
+                        !isResolvableCdLbn(candidate.lbn))
+                    {
+                        continue;
+                    }
+                    const size_t candidateBytes = clampReadBytes(
+                        candidate.sectors,
+                        candidate.buf & PS2_RAM_MASK);
+                    CdResolvedReadSource candidateSource{};
+                    if (!resolveCdReadSource(candidate.lbn,
+                                             candidate.sectors,
+                                             candidateBytes,
+                                             candidateSource))
+                    {
+                        continue;
+                    }
+                    selected = candidate;
+                    selectedBytes = candidateBytes;
+                    source = std::move(candidateSource);
+                    resolved = true;
+                    break;
+                }
+            }
+
+            if (!resolved)
+            {
+                g_lastCdError = 0x30; // SCECdErREAD
+                setReturnS32(ctx, 0);
+                return;
+            }
+
+            const uint32_t destination = selected.buf & PS2_RAM_MASK;
+            const uint64_t token = ++g_cdReadGeneration;
+            g_cdPendingRead = {
+                true,
+                token,
+                selected.lbn,
+                selected.sectors,
+                destination,
+                selectedBytes};
+            g_cdStreamingLbn = selected.lbn;
+            g_lastCdError = 0;
+
+            auto operation = std::make_shared<CdAsyncReadOperation>();
+            const R5900Context callbackContext = *ctx;
+            const uint32_t completionDelay = cdReadDelayMicroseconds(selected.sectors);
+            try
+            {
+                std::thread(
+                    [operation, source = std::move(source)]() mutable
+                    {
+                        operation->succeeded = readResolvedCdSource(source, operation->data);
+                        operation->completed.store(true, std::memory_order_release);
+                    })
+                    .detach();
+            }
+            catch (...)
+            {
+                g_cdPendingRead = {};
+                g_lastCdError = 0x30; // SCECdErREAD
+                setReturnS32(ctx, 0);
+                return;
+            }
+
+            runtime->eeScheduler().scheduleHostCallback(
+                std::chrono::microseconds(completionDelay),
+                [runtime,
+                 rdram,
+                 operation,
+                 callbackContext,
+                 token,
+                 lbn = selected.lbn,
+                 sectors = selected.sectors,
+                 destination]() mutable
+                {
+                    publishAsyncCdRead(runtime,
+                                       rdram,
+                                       std::move(operation),
+                                       callbackContext,
+                                       token,
+                                       lbn,
+                                       sectors,
+                                       destination);
+                });
+
+            setReturnS32(ctx, 1);
+            return;
+        }
+
+        auto tryRead = [&](const CdReadArgs &args, std::vector<uint8_t> &data) -> bool
         {
             const uint32_t offset = args.buf & PS2_RAM_MASK;
             const size_t bytes = clampReadBytes(args.sectors, offset);
+            data.assign(bytes, 0u);
             if (bytes == 0)
             {
                 return true;
             }
 
-            return readCdSectors(args.lbn, args.sectors, rdram + offset, bytes);
+            if (!readCdSectors(args.lbn, args.sectors, data.data(), bytes))
+            {
+                data.clear();
+                return false;
+            }
+            return true;
         };
 
         CdReadArgs selected{a0, a1, a2, "a0/a1/a2"};
-        bool ok = tryRead(selected);
+        std::vector<uint8_t> selectedData;
+        bool ok = tryRead(selected, selectedData);
 
         if (!ok)
         {
@@ -271,7 +624,7 @@ namespace ps2_stubs
                         continue;
                     }
 
-                    if (tryRead(candidate))
+                    if (tryRead(candidate, selectedData))
                     {
                         static uint32_t recoverLogCount = 0;
                         if (recoverLogCount < 16)
@@ -315,8 +668,13 @@ namespace ps2_stubs
 
         if (ok)
         {
+            const uint32_t destination = selected.buf & PS2_RAM_MASK;
+            if (!selectedData.empty())
+            {
+                std::memcpy(rdram + destination, selectedData.data(), selectedData.size());
+            }
             g_cdStreamingLbn = selected.lbn + selected.sectors;
-            setReturnS32(ctx, 1); // command accepted/success
+            setReturnS32(ctx, 1);
             return;
         }
 
@@ -325,7 +683,32 @@ namespace ps2_stubs
 
     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, 0); // 0 = completed/not busy
+        static uint32_t syncLogCount = 0;
+        if (syncLogCount < 64)
+        {
+            RUNTIME_LOG("[sceCdSync:CALL] pc=0x" << std::hex << ctx->pc
+                                                 << " ra=0x" << getRegU32(ctx, 31)
+                                                 << " mode=0x" << getRegU32(ctx, 4)
+                                                 << std::dec << std::endl);
+            ++syncLogCount;
+        }
+        if (!g_cdPendingRead.busy)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+
+        const uint32_t mode = getRegU32(ctx, 4);
+        if (mode != 0u || runtime == nullptr)
+        {
+            setReturnS32(ctx, 1); // command is still active
+            return;
+        }
+
+        runtime->eeScheduler().waitExternal(
+            EeWaitReason::External,
+            kCdReadWaitType,
+            g_cdPendingRead.token);
     }
 
     void sceCdGetError(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -350,12 +733,30 @@ namespace ps2_stubs
 
     void sceCdBreak(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (g_cdPendingRead.busy)
+        {
+            const uint64_t token = g_cdPendingRead.token;
+            g_cdPendingRead.busy = false;
+            ++g_cdReadGeneration;
+            g_lastCdError = 0x30; // SCECdErREAD
+            if (runtime != nullptr)
+            {
+                runtime->eeScheduler().completeExternalWait(kCdReadWaitType, token, -1);
+            }
+        }
         setReturnS32(ctx, 1);
     }
 
     void sceCdCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, 0);
+        const uint32_t previous = g_cdCallbackAddress;
+        g_cdCallbackAddress = getRegU32(ctx, 4);
+        g_cdCallbackGp = getRegU32(ctx, 28);
+        RUNTIME_LOG("[sceCdCallback] previous=0x" << std::hex << previous
+                                                  << " current=0x" << g_cdCallbackAddress
+                                                  << " gp=0x" << g_cdCallbackGp
+                                                  << std::dec << std::endl);
+        setReturnU32(ctx, previous);
     }
 
     void sceCdChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -396,6 +797,15 @@ namespace ps2_stubs
 
     void sceCdInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (g_cdPendingRead.busy && runtime != nullptr)
+        {
+            runtime->eeScheduler().completeExternalWait(
+                kCdReadWaitType,
+                g_cdPendingRead.token,
+                -1);
+        }
+        ++g_cdReadGeneration;
+        g_cdPendingRead = {};
         g_cdInitialized = true;
         g_lastCdError = 0;
         g_cdStreamTiming = {};

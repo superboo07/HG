@@ -25,6 +25,8 @@
 #include <mutex>
 #include <atomic>
 #include <limits>
+#include <memory>
+#include <thread>
 
 #include "ps2_host_backend.h"
 #include "Helpers/Support.h"

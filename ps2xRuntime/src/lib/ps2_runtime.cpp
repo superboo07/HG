@@ -5,6 +5,8 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_opengl_compute.h"
+#include "runtime/gs/gs_opengl_hybrid_backend.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -13,12 +15,15 @@
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
+#include "rlgl.h"
 
 #include <iostream>
 #include <fstream>
+#include <iomanip>
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <chrono>
@@ -26,6 +31,7 @@
 #include <thread>
 #include <unordered_map>
 #include <sstream>
+#include <vector>
 
 namespace ps2_stubs
 {
@@ -108,6 +114,549 @@ namespace
     };
 
     thread_local DispatchHistory g_dispatchHistory;
+
+    using DispatchProfileClock = std::chrono::steady_clock;
+
+    struct DispatchProfileStat
+    {
+        uint64_t calls = 0u;
+        uint64_t inclusiveNanoseconds = 0u;
+        uint64_t exclusiveNanoseconds = 0u;
+    };
+
+    struct DispatchProfileFrame
+    {
+        uint32_t targetPc = 0u;
+        DispatchProfileClock::time_point start{};
+        uint64_t childNanoseconds = 0u;
+    };
+
+    struct DispatchProfileState
+    {
+        bool initialized = false;
+        bool enabled = false;
+        DispatchProfileClock::time_point start{};
+        DispatchProfileClock::time_point deadline{};
+        std::unordered_map<uint32_t, DispatchProfileStat> stats;
+        std::vector<DispatchProfileFrame> frames;
+    };
+
+    thread_local DispatchProfileState g_dispatchProfile;
+
+    struct DispatchTraceState
+    {
+        bool initialized = false;
+        uint64_t skip = 0u;
+        uint64_t limit = 256u;
+        std::vector<uint32_t> sourcePcs;
+        std::vector<uint32_t> targetPcs;
+        std::vector<uint32_t> objectAddresses;
+        std::vector<uint32_t> memoryAddresses;
+        bool hasCommandCursorRange = false;
+        uint32_t commandCursorStart = 0u;
+        uint32_t commandCursorEnd = 0u;
+        std::unordered_map<uint32_t, uint64_t> counts;
+        std::unordered_map<uint32_t, uint64_t> emittedCounts;
+    };
+
+    thread_local DispatchTraceState g_dispatchTrace;
+
+    bool beginDispatchTrace(const uint8_t *rdram,
+                            uint32_t targetPc,
+                            uint32_t sourcePc,
+                            uint32_t objectAddress,
+                            uint64_t &ordinal)
+    {
+        DispatchTraceState &trace = g_dispatchTrace;
+        if (!trace.initialized)
+        {
+            trace.initialized = true;
+            if (const char *skipText = std::getenv("PS2X_DISPATCH_TRACE_SKIP");
+                skipText != nullptr && *skipText != '\0')
+            {
+                char *end = nullptr;
+                const unsigned long long parsed = std::strtoull(skipText, &end, 0);
+                if (end != skipText && *end == '\0')
+                {
+                    trace.skip = parsed;
+                }
+            }
+            if (const char *limitText = std::getenv("PS2X_DISPATCH_TRACE_LIMIT");
+                limitText != nullptr && *limitText != '\0')
+            {
+                char *end = nullptr;
+                const unsigned long long parsed = std::strtoull(limitText, &end, 0);
+                if (end != limitText && *end == '\0' && parsed > 0u)
+                {
+                    trace.limit = parsed;
+                }
+            }
+            if (const char *sourceText = std::getenv("PS2X_DISPATCH_TRACE_SOURCE_PC");
+                sourceText != nullptr && *sourceText != '\0')
+            {
+                const char *cursor = sourceText;
+                while (*cursor != '\0')
+                {
+                    while (*cursor != '\0' &&
+                           (std::isspace(static_cast<unsigned char>(*cursor)) || *cursor == ',' || *cursor == ';'))
+                    {
+                        ++cursor;
+                    }
+                    if (*cursor == '\0')
+                    {
+                        break;
+                    }
+
+                    char *end = nullptr;
+                    const unsigned long parsed = std::strtoul(cursor, &end, 0);
+                    if (end == cursor)
+                    {
+                        ++cursor;
+                        continue;
+                    }
+                    if (parsed <= std::numeric_limits<uint32_t>::max())
+                    {
+                        trace.sourcePcs.push_back(static_cast<uint32_t>(parsed));
+                    }
+                    cursor = end;
+                }
+            }
+
+            const char *cursor = std::getenv("PS2X_DISPATCH_TRACE_PC");
+            while (cursor != nullptr && *cursor != '\0')
+            {
+                while (*cursor != '\0' &&
+                       (std::isspace(static_cast<unsigned char>(*cursor)) || *cursor == ',' || *cursor == ';'))
+                {
+                    ++cursor;
+                }
+                if (*cursor == '\0')
+                {
+                    break;
+                }
+
+                char *end = nullptr;
+                const unsigned long parsed = std::strtoul(cursor, &end, 0);
+                if (end == cursor)
+                {
+                    ++cursor;
+                    continue;
+                }
+                if (parsed <= std::numeric_limits<uint32_t>::max())
+                {
+                    trace.targetPcs.push_back(static_cast<uint32_t>(parsed));
+                }
+                cursor = end;
+            }
+
+            cursor = std::getenv("PS2X_DISPATCH_TRACE_OBJECT");
+            while (cursor != nullptr && *cursor != '\0')
+            {
+                while (*cursor != '\0' &&
+                       (std::isspace(static_cast<unsigned char>(*cursor)) || *cursor == ',' || *cursor == ';'))
+                {
+                    ++cursor;
+                }
+                if (*cursor == '\0')
+                {
+                    break;
+                }
+
+                char *end = nullptr;
+                const unsigned long parsed = std::strtoul(cursor, &end, 0);
+                if (end == cursor)
+                {
+                    ++cursor;
+                    continue;
+                }
+                if (parsed <= std::numeric_limits<uint32_t>::max())
+                {
+                    trace.objectAddresses.push_back(static_cast<uint32_t>(parsed));
+                }
+                cursor = end;
+            }
+
+            cursor = std::getenv("PS2X_DISPATCH_TRACE_MEMORY");
+            while (cursor != nullptr && *cursor != '\0')
+            {
+                while (*cursor != '\0' &&
+                       (std::isspace(static_cast<unsigned char>(*cursor)) || *cursor == ',' || *cursor == ';'))
+                {
+                    ++cursor;
+                }
+                if (*cursor == '\0')
+                {
+                    break;
+                }
+
+                char *end = nullptr;
+                const unsigned long parsed = std::strtoul(cursor, &end, 0);
+                if (end == cursor)
+                {
+                    ++cursor;
+                    continue;
+                }
+                if (parsed <= std::numeric_limits<uint32_t>::max())
+                {
+                    trace.memoryAddresses.push_back(static_cast<uint32_t>(parsed));
+                }
+                cursor = end;
+            }
+
+            if (const char *rangeText = std::getenv("PS2X_DISPATCH_TRACE_CURSOR_RANGE");
+                rangeText != nullptr && *rangeText != '\0')
+            {
+                char *separator = nullptr;
+                const unsigned long start = std::strtoul(rangeText, &separator, 0);
+                while (separator != rangeText &&
+                       std::isspace(static_cast<unsigned char>(*separator)))
+                {
+                    ++separator;
+                }
+                if (separator != rangeText && (*separator == '-' || *separator == ':'))
+                {
+                    char *end = nullptr;
+                    const unsigned long finish = std::strtoul(separator + 1, &end, 0);
+                    while (end != separator + 1 &&
+                           std::isspace(static_cast<unsigned char>(*end)))
+                    {
+                        ++end;
+                    }
+                    if (end != separator + 1 && *end == '\0' &&
+                        start <= std::numeric_limits<uint32_t>::max() &&
+                        finish <= std::numeric_limits<uint32_t>::max() && start < finish)
+                    {
+                        trace.hasCommandCursorRange = true;
+                        trace.commandCursorStart = static_cast<uint32_t>(start);
+                        trace.commandCursorEnd = static_cast<uint32_t>(finish);
+                    }
+                }
+            }
+        }
+
+        if (trace.targetPcs.empty() && trace.sourcePcs.empty())
+        {
+            return false;
+        }
+        if (!trace.targetPcs.empty() &&
+            std::find(trace.targetPcs.begin(), trace.targetPcs.end(), targetPc) == trace.targetPcs.end())
+        {
+            return false;
+        }
+        if (!trace.sourcePcs.empty() &&
+            std::find(trace.sourcePcs.begin(), trace.sourcePcs.end(), sourcePc) == trace.sourcePcs.end())
+        {
+            return false;
+        }
+        if (!trace.objectAddresses.empty() &&
+            std::find(trace.objectAddresses.begin(), trace.objectAddresses.end(), objectAddress) ==
+                trace.objectAddresses.end())
+        {
+            return false;
+        }
+        if (trace.hasCommandCursorRange)
+        {
+            const uint32_t physical = (objectAddress + 0x4u) & 0x1FFFFFFFu;
+            if (physical > PS2_RAM_SIZE - sizeof(uint32_t))
+            {
+                return false;
+            }
+
+            uint32_t commandCursor = 0u;
+            std::memcpy(&commandCursor, rdram + physical, sizeof(commandCursor));
+            if (commandCursor < trace.commandCursorStart || commandCursor >= trace.commandCursorEnd)
+            {
+                return false;
+            }
+        }
+
+        uint64_t &count = trace.counts[targetPc];
+        ordinal = ++count;
+        if (ordinal <= trace.skip)
+        {
+            return false;
+        }
+        uint64_t &emittedCount = trace.emittedCounts[targetPc];
+        if (emittedCount >= trace.limit)
+        {
+            return false;
+        }
+        ++emittedCount;
+        return true;
+    }
+
+    void logDispatchTrace(const char *phase,
+                          const uint8_t *rdram,
+                          const R5900Context *ctx,
+                          uint32_t targetPc,
+                          uint32_t sourcePc,
+                          uint32_t objectAddress,
+                          uint64_t ordinal)
+    {
+        auto readGuestU8 = [rdram](uint32_t address, uint8_t &value) -> bool
+        {
+            const uint32_t physical = address & 0x1FFFFFFFu;
+            if (physical >= PS2_RAM_SIZE)
+            {
+                return false;
+            }
+            value = rdram[physical];
+            return true;
+        };
+        auto readGuestU32 = [rdram](uint32_t address, uint32_t &value) -> bool
+        {
+            const uint32_t physical = address & 0x1FFFFFFFu;
+            if (physical > PS2_RAM_SIZE - sizeof(value))
+            {
+                return false;
+            }
+            std::memcpy(&value, rdram + physical, sizeof(value));
+            return true;
+        };
+
+        constexpr std::array<uint32_t, 12> byteOffsets = {
+            0x30u, 0x140u, 0x250u, 0x360u, 0x470u, 0x474u,
+            0x475u, 0x498u, 0x499u, 0x7B8u, 0xA39u, 0xA3Au};
+        uint32_t vtable = 0u;
+        uint32_t commandCursor = 0u;
+        uint32_t field834 = 0u;
+        uint32_t globalE4D0 = 0u;
+        uint32_t globalE4D8 = 0u;
+        uint32_t globalE560 = 0u;
+        uint32_t globalF828 = 0u;
+        const bool objectReadable = readGuestU32(objectAddress, vtable);
+        const bool commandCursorReadable = readGuestU32(objectAddress + 0x4u, commandCursor);
+        const bool field834Readable = readGuestU32(objectAddress + 0x834u, field834);
+        readGuestU32(0x0044E4D0u, globalE4D0);
+        readGuestU32(0x0044E4D8u, globalE4D8);
+        readGuestU32(0x0044E560u, globalE560);
+        readGuestU32(0x0044F828u, globalF828);
+
+        std::ostringstream oss;
+        oss << "[dispatch-trace] phase=" << phase
+            << " ordinal=" << ordinal
+            << " target=0x" << std::hex << targetPc
+            << " source=0x" << sourcePc
+            << " pc=0x" << ctx->pc
+            << " ra=0x" << GPR_U32(ctx, 31)
+            << " v0=0x" << GPR_U32(ctx, 2)
+            << " a0=0x" << GPR_U32(ctx, 4)
+            << " a1=0x" << GPR_U32(ctx, 5)
+            << " a2=0x" << GPR_U32(ctx, 6)
+            << " a3=0x" << GPR_U32(ctx, 7)
+            << " s0=0x" << GPR_U32(ctx, 16)
+            << " s1=0x" << GPR_U32(ctx, 17)
+            << " s2=0x" << GPR_U32(ctx, 18)
+            << " s3=0x" << GPR_U32(ctx, 19)
+            << " s4=0x" << GPR_U32(ctx, 20)
+            << " s5=0x" << GPR_U32(ctx, 21)
+            << " object=0x" << objectAddress
+            << " readable=" << (objectReadable ? "yes" : "no")
+            << " vtable=0x" << vtable
+            << " cursor=";
+        if (commandCursorReadable)
+        {
+            oss << "0x" << commandCursor << " bytes=";
+            for (uint32_t index = 0u; index < 16u; ++index)
+            {
+                uint8_t value = 0u;
+                if (!readGuestU8(commandCursor + index, value))
+                {
+                    oss << "--";
+                }
+                else
+                {
+                    oss << std::setw(2) << std::setfill('0') << static_cast<uint32_t>(value);
+                }
+            }
+            oss << std::setfill(' ');
+        }
+        else
+        {
+            oss << "-- bytes=--";
+        }
+        oss << " script=0x" << GPR_U32(ctx, 17) << " script-bytes=";
+        for (uint32_t index = 0u; index < 24u; ++index)
+        {
+            uint8_t value = 0u;
+            if (!readGuestU8(GPR_U32(ctx, 17) + index, value))
+            {
+                oss << "--";
+            }
+            else
+            {
+                oss << std::setw(2) << std::setfill('0') << static_cast<uint32_t>(value);
+            }
+        }
+        oss << std::setfill(' ');
+        for (const uint32_t offset : byteOffsets)
+        {
+            uint8_t value = 0u;
+            const bool readable = readGuestU8(objectAddress + offset, value);
+            oss << " b+0x" << offset << '=';
+            if (readable)
+            {
+                oss << "0x" << static_cast<uint32_t>(value);
+            }
+            else
+            {
+                oss << "--";
+            }
+        }
+        oss << " w+0x834=";
+        if (field834Readable)
+        {
+            oss << "0x" << field834;
+        }
+        else
+        {
+            oss << "--";
+        }
+        oss << " g44e4d0=0x" << globalE4D0
+            << " g44e4d8=0x" << globalE4D8
+            << " g44e560=0x" << globalE560
+            << " g44f828=0x" << globalF828;
+        for (const uint32_t address : g_dispatchTrace.memoryAddresses)
+        {
+            uint32_t value = 0u;
+            const bool readable = readGuestU32(address, value);
+            oss << " m0x" << address << '=';
+            if (readable)
+            {
+                oss << "0x" << value;
+            }
+            else
+            {
+                oss << "--";
+            }
+        }
+        oss << std::dec;
+        std::cerr << oss.str() << std::endl;
+    }
+
+    bool beginDispatchProfile(uint32_t targetPc)
+    {
+        DispatchProfileState &profile = g_dispatchProfile;
+        if (!profile.initialized)
+        {
+            profile.initialized = true;
+            const char *text = std::getenv("PS2X_DISPATCH_PROFILE_SECONDS");
+            if (text != nullptr && *text != '\0')
+            {
+                char *end = nullptr;
+                const double seconds = std::strtod(text, &end);
+                if (end != text && *end == '\0' && seconds > 0.0)
+                {
+                    double delaySeconds = 0.0;
+                    if (const char *delayText = std::getenv("PS2X_DISPATCH_PROFILE_DELAY_SECONDS");
+                        delayText != nullptr && *delayText != '\0')
+                    {
+                        char *delayEnd = nullptr;
+                        const double parsedDelay = std::strtod(delayText, &delayEnd);
+                        if (delayEnd != delayText && *delayEnd == '\0' && parsedDelay > 0.0)
+                            delaySeconds = parsedDelay;
+                    }
+                    profile.enabled = true;
+                    profile.start = DispatchProfileClock::now() +
+                                    std::chrono::duration_cast<DispatchProfileClock::duration>(
+                                        std::chrono::duration<double>(delaySeconds));
+                    profile.deadline = profile.start +
+                                       std::chrono::duration_cast<DispatchProfileClock::duration>(
+                                           std::chrono::duration<double>(seconds));
+                    profile.stats.reserve(1024u);
+                    profile.frames.reserve(64u);
+                }
+            }
+        }
+
+        if (!profile.enabled)
+        {
+            return false;
+        }
+
+        if (DispatchProfileClock::now() < profile.start)
+        {
+            return false;
+        }
+
+        profile.frames.push_back({targetPc, DispatchProfileClock::now(), 0u});
+        return true;
+    }
+
+    void endDispatchProfile()
+    {
+        DispatchProfileState &profile = g_dispatchProfile;
+        if (!profile.enabled || profile.frames.empty())
+        {
+            return;
+        }
+
+        const auto now = DispatchProfileClock::now();
+        const DispatchProfileFrame frame = profile.frames.back();
+        profile.frames.pop_back();
+        const uint64_t inclusive = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - frame.start).count());
+        const uint64_t exclusive = inclusive >= frame.childNanoseconds
+                                       ? inclusive - frame.childNanoseconds
+                                       : 0u;
+        DispatchProfileStat &stat = profile.stats[frame.targetPc];
+        ++stat.calls;
+        stat.inclusiveNanoseconds += inclusive;
+        stat.exclusiveNanoseconds += exclusive;
+        if (!profile.frames.empty())
+        {
+            profile.frames.back().childNanoseconds += inclusive;
+        }
+
+        if (now < profile.deadline || !profile.frames.empty())
+        {
+            return;
+        }
+
+        std::vector<std::pair<uint32_t, DispatchProfileStat>> ordered(profile.stats.begin(), profile.stats.end());
+        std::sort(ordered.begin(), ordered.end(), [](const auto &left, const auto &right)
+                  { return left.second.exclusiveNanoseconds > right.second.exclusiveNanoseconds; });
+        std::cerr << "[dispatch-profile] top functions by exclusive host time" << std::endl;
+        const size_t limit = std::min<size_t>(20u, ordered.size());
+        for (size_t index = 0u; index < limit; ++index)
+        {
+            const auto &[pc, value] = ordered[index];
+            std::cerr << "[dispatch-profile] pc=0x" << std::hex << pc << std::dec
+                      << " calls=" << value.calls
+                      << " exclusive_ms=" << (value.exclusiveNanoseconds / 1000000.0)
+                      << " inclusive_ms=" << (value.inclusiveNanoseconds / 1000000.0)
+                      << std::endl;
+        }
+        auto orderedInclusive = ordered;
+        std::sort(orderedInclusive.begin(), orderedInclusive.end(), [](const auto &left, const auto &right)
+                  { return left.second.inclusiveNanoseconds > right.second.inclusiveNanoseconds; });
+        std::cerr << "[dispatch-profile] top functions by inclusive host time" << std::endl;
+        const size_t inclusiveLimit = std::min<size_t>(30u, orderedInclusive.size());
+        for (size_t index = 0u; index < inclusiveLimit; ++index)
+        {
+            const auto &[pc, value] = orderedInclusive[index];
+            std::cerr << "[dispatch-profile-inclusive] pc=0x" << std::hex << pc << std::dec
+                      << " calls=" << value.calls
+                      << " exclusive_ms=" << (value.exclusiveNanoseconds / 1000000.0)
+                      << " inclusive_ms=" << (value.inclusiveNanoseconds / 1000000.0)
+                      << std::endl;
+        }
+        auto orderedCalls = ordered;
+        std::sort(orderedCalls.begin(), orderedCalls.end(), [](const auto &left, const auto &right)
+                  { return left.second.calls > right.second.calls; });
+        std::cerr << "[dispatch-profile] top functions by call count" << std::endl;
+        const size_t callLimit = std::min<size_t>(30u, orderedCalls.size());
+        for (size_t index = 0u; index < callLimit; ++index)
+        {
+            const auto &[pc, value] = orderedCalls[index];
+            std::cerr << "[dispatch-profile-calls] pc=0x" << std::hex << pc << std::dec
+                      << " calls=" << value.calls
+                      << " exclusive_ms=" << (value.exclusiveNanoseconds / 1000000.0)
+                      << " inclusive_ms=" << (value.inclusiveNanoseconds / 1000000.0)
+                      << std::endl;
+        }
+        profile.enabled = false;
+    }
 
     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
     {
@@ -327,6 +876,66 @@ namespace
         return absolute.lexically_normal();
     }
 
+    std::string portableSaveGameKey(const std::filesystem::path &elfPath)
+    {
+        std::string key = elfPath.filename().string();
+        for (char &ch : key)
+        {
+            const unsigned char value = static_cast<unsigned char>(ch);
+            if (!std::isalnum(value) && ch != '-' && ch != '_' && ch != '.')
+            {
+                ch = '_';
+            }
+        }
+        return key.empty() ? std::string("game") : key;
+    }
+
+    std::filesystem::path portableMemoryCardRoot(const std::filesystem::path &elfPath,
+                                                  const std::filesystem::path &elfDirectory)
+    {
+        if (const char *overrideRoot = std::getenv("PS2X_MC_ROOT");
+            overrideRoot && overrideRoot[0] != '\0')
+        {
+            return normalizeAbsolutePath(std::filesystem::path(overrideRoot));
+        }
+
+        std::filesystem::path dataRoot;
+#if defined(_WIN32)
+        if (const char *localAppData = std::getenv("LOCALAPPDATA");
+            localAppData && localAppData[0] != '\0')
+        {
+            dataRoot = localAppData;
+        }
+        else if (const char *userProfile = std::getenv("USERPROFILE");
+                 userProfile && userProfile[0] != '\0')
+        {
+            dataRoot = std::filesystem::path(userProfile) / "AppData" / "Local";
+        }
+#elif defined(__APPLE__)
+        if (const char *home = std::getenv("HOME"); home && home[0] != '\0')
+        {
+            dataRoot = std::filesystem::path(home) / "Library" / "Application Support";
+        }
+#elif !defined(PLATFORM_VITA)
+        if (const char *xdgData = std::getenv("XDG_DATA_HOME");
+            xdgData && xdgData[0] != '\0')
+        {
+            dataRoot = xdgData;
+        }
+        else if (const char *home = std::getenv("HOME"); home && home[0] != '\0')
+        {
+            dataRoot = std::filesystem::path(home) / ".local" / "share";
+        }
+#endif
+
+        if (dataRoot.empty())
+        {
+            return normalizeAbsolutePath(elfDirectory / "mc0");
+        }
+        return normalizeAbsolutePath(dataRoot / "PS2Recomp" /
+                                     portableSaveGameKey(elfPath) / "mc0");
+    }
+
     PS2Runtime::IoPaths &runtimeIoPaths()
     {
         static PS2Runtime::IoPaths paths = []()
@@ -387,19 +996,22 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
-    if (needsLatch)
+    // The SDK swap bindings latch the completed display page immediately
+    // before clearing the next draw buffer. Only seed an initial frame here;
+    // independently re-latching at each host-observed VSync races the guest's
+    // clear/draw sequence and can publish an isolated black frame.
+    if (!s_hasLatchedInitialFrame)
     {
         rt->gs().latchHostPresentationFrame();
-        s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
-    else if (s_hasUploadedFrame)
+    if (currentTick == s_lastPresentationTick && s_hasUploadedFrame)
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
         return;
     }
+    s_lastPresentationTick = currentTick;
 
     s_scratch.clear();
     uint32_t width = 0u;
@@ -471,7 +1083,141 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         }
     }
 
+    if (std::getenv("PS2X_TRACE_FRAME_PRESENTATION") != nullptr)
+    {
+        static uint32_t s_traceFrameCount = 0u;
+        const char *traceFromText = std::getenv("PS2X_TRACE_FRAME_PRESENTATION_FROM_TICK");
+        const uint64_t traceFromTick = traceFromText && traceFromText[0] != '\0'
+                                           ? std::strtoull(traceFromText, nullptr, 0)
+                                           : 0u;
+        if (currentTick >= traceFromTick && s_traceFrameCount < 512u)
+        {
+            uint64_t hash = 1469598103934665603ull;
+            uint64_t rgbEnergy = 0u;
+            uint32_t nonblackPixels = 0u;
+            for (const uint8_t byte : s_uploadBuffer)
+            {
+                hash ^= byte;
+                hash *= 1099511628211ull;
+            }
+            for (size_t offset = 0u; offset + 3u < s_uploadBuffer.size(); offset += 4u)
+            {
+                const uint32_t rgb = static_cast<uint32_t>(s_uploadBuffer[offset]) +
+                                     static_cast<uint32_t>(s_uploadBuffer[offset + 1u]) +
+                                     static_cast<uint32_t>(s_uploadBuffer[offset + 2u]);
+                rgbEnergy += rgb;
+                nonblackPixels += static_cast<uint32_t>(rgb != 0u);
+            }
+            std::cerr << "[frame:present] tick=" << currentTick
+                      << " displayFbp=" << displayFbp
+                      << " sourceFbp=" << sourceFbp
+                      << " preferred=" << static_cast<uint32_t>(usedPreferredDisplaySource ? 1u : 0u)
+                      << " size=" << width << 'x' << height
+                      << " nonblack=" << nonblackPixels
+                      << " rgbEnergy=" << rgbEnergy
+                      << " hash=0x" << std::hex << hash << std::dec << std::endl;
+            ++s_traceFrameCount;
+        }
+    }
+
     UpdateTexture(tex, s_uploadBuffer.data());
+    if (const char *capturePath = std::getenv("PS2X_CAPTURE_FRAME");
+        capturePath && capturePath[0] != '\0' && currentTick != 0u)
+    {
+        static uint64_t s_lastCaptureTick = std::numeric_limits<uint64_t>::max();
+        static bool s_targetTickCaptured = false;
+        const char *targetTickText = std::getenv("PS2X_CAPTURE_FRAME_TICK");
+        const bool hasTargetTick = targetTickText && targetTickText[0] != '\0';
+        const uint64_t targetTick = hasTargetTick
+                                        ? std::strtoull(targetTickText, nullptr, 0)
+                                        : 0u;
+        const char *captureIntervalText = std::getenv("PS2X_CAPTURE_FRAME_INTERVAL");
+        const uint64_t captureInterval = captureIntervalText && captureIntervalText[0] != '\0'
+                                             ? std::max<uint64_t>(1u, std::strtoull(captureIntervalText, nullptr, 0))
+                                             : 120u;
+        const char *captureFromText = std::getenv("PS2X_CAPTURE_FRAME_FROM_TICK");
+        const char *captureToText = std::getenv("PS2X_CAPTURE_FRAME_TO_TICK");
+        const uint64_t captureFromTick = captureFromText && captureFromText[0] != '\0'
+                                             ? std::strtoull(captureFromText, nullptr, 0)
+                                             : 0u;
+        const uint64_t captureToTick = captureToText && captureToText[0] != '\0'
+                                           ? std::strtoull(captureToText, nullptr, 0)
+                                           : 0u;
+        const bool insideCaptureRange = currentTick >= captureFromTick &&
+                                        (captureToTick == 0u || currentTick <= captureToTick);
+        const bool shouldCapture = insideCaptureRange &&
+                                   (hasTargetTick
+                                        ? (!s_targetTickCaptured && currentTick >= targetTick)
+                                        : (s_lastCaptureTick == std::numeric_limits<uint64_t>::max() ||
+                                           currentTick < s_lastCaptureTick ||
+                                           currentTick - s_lastCaptureTick >= captureInterval));
+        if (shouldCapture)
+        {
+            std::string resolvedCapturePath(capturePath);
+            if (const size_t tickMarker = resolvedCapturePath.find("{tick}");
+                tickMarker != std::string::npos)
+            {
+                resolvedCapturePath.replace(tickMarker, 6u, std::to_string(currentTick));
+            }
+            std::ofstream capture(resolvedCapturePath, std::ios::binary | std::ios::trunc);
+            if (capture)
+            {
+                capture << "P6\n" << FB_WIDTH << ' ' << FB_HEIGHT << "\n255\n";
+                for (size_t offset = 0; offset + 3u < s_uploadBuffer.size(); offset += 4u)
+                {
+                    capture.write(reinterpret_cast<const char *>(s_uploadBuffer.data() + offset), 3);
+                }
+                s_lastCaptureTick = currentTick;
+                s_targetTickCaptured = hasTargetTick;
+                static bool s_sequenceCaptureLogged = false;
+                if (!hasTargetTick && !s_sequenceCaptureLogged)
+                {
+                    s_sequenceCaptureLogged = true;
+                    const auto unixMicroseconds =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+                    std::cerr << "[frame:capture-sequence] first_tick=" << currentTick
+                              << " unix_us=" << unixMicroseconds
+                              << " interval=" << captureInterval
+                              << " path=" << resolvedCapturePath << std::endl;
+                }
+                if (hasTargetTick)
+                {
+                    const GSRegisters &captureRegs = rt->memory().gs();
+                    std::cerr << "[frame:capture] tick=" << currentTick
+                              << " path=" << resolvedCapturePath
+                              << " displayFbp=" << displayFbp
+                              << " sourceFbp=" << sourceFbp
+                              << " preferred=" << static_cast<uint32_t>(usedPreferredDisplaySource ? 1u : 0u)
+                              << " pmode=0x" << std::hex << captureRegs.pmode
+                              << " dispfb1=0x" << captureRegs.dispfb1
+                              << " display1=0x" << captureRegs.display1
+                              << " dispfb2=0x" << captureRegs.dispfb2
+                              << " display2=0x" << captureRegs.display2
+                              << std::dec << std::endl;
+                }
+
+                if (const char *vramCapturePath = std::getenv("PS2X_CAPTURE_GS_VRAM");
+                    vramCapturePath && vramCapturePath[0] != '\0')
+                {
+                    const uint8_t *const vram = rt->memory().getGSVRAM();
+                    if (vram)
+                    {
+                        std::ofstream vramCapture(vramCapturePath, std::ios::binary | std::ios::trunc);
+                        if (vramCapture)
+                        {
+                            vramCapture.write(reinterpret_cast<const char *>(vram),
+                                              static_cast<std::streamsize>(PS2_GS_VRAM_SIZE));
+                            std::cerr << "[frame:capture-vram] tick=" << currentTick
+                                      << " path=" << vramCapturePath
+                                      << " bytes=" << PS2_GS_VRAM_SIZE << std::endl;
+                        }
+                    }
+                }
+            }
+        }
+    }
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
@@ -536,6 +1282,7 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        m_gs.setAsyncPacketProcessing(false);
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -622,6 +1369,17 @@ bool PS2Runtime::syncCoreSubsystems()
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
+    m_memory.setIpuToDmaCallback([this](uint32_t madr, uint32_t qwc)
+                                 {
+                                     const uint64_t byteCount = static_cast<uint64_t>(qwc) * 16u;
+                                     if (byteCount <= std::numeric_limits<uint32_t>::max())
+                                     {
+                                         ps2_stubs::notifyMpegIpuToDma(
+                                             m_memory.getRDRAM(), this, madr,
+                                             static_cast<uint32_t>(byteCount));
+                                     } });
+    m_memory.setIpuToDmaCompletionCallback([this]()
+                                           { ps2_stubs::notifyMpegIpuToDmaComplete(m_memory.getRDRAM(), this); });
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
@@ -696,10 +1454,27 @@ bool PS2Runtime::initialize(const char *title)
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        if (std::getenv("PS2X_GS_OPENGL_PROBE") != nullptr)
+        {
+            const GSOpenGLComputeProbeResult probe = ProbeGSOpenGLCompute();
+            std::cerr << "[gs-opengl] available=" << probe.available
+                      << " passed=" << probe.passed
+                      << " detail=" << probe.detail << std::endl;
+        }
+        if (rlGetVersion() == RL_OPENGL_43 &&
+            std::getenv("PS2X_DISABLE_OPENGL_GS") == nullptr)
+        {
+            m_gs.setRasterBackend(std::make_unique<GSOpenGLHybridBackend>());
+            std::cerr << "[gs-opengl-live] ordered hybrid backend enabled" << std::endl;
+        }
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
-        SetTargetFPS(60);
+        // The OpenGL backend owns its context on this thread.  Do not let
+        // Raylib's presentation limiter delay ordered GPU work (especially
+        // guest-visible readbacks) by one display interval per barrier.  The
+        // run loop below schedules presentation separately at NTSC field rate.
+        SetTargetFPS(0);
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -1023,7 +1798,7 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
     {
         paths.hostRoot = paths.elfDirectory;
         paths.cdRoot = paths.elfDirectory;
-        paths.mcRoot = paths.elfDirectory / "mc0";
+        paths.mcRoot = portableMemoryCardRoot(paths.elfPath, paths.elfDirectory);
     }
 
     setIoPaths(paths);
@@ -1356,7 +2131,37 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
-    targetFn(rdram, ctx, this);
+    const bool profileDispatch = beginDispatchProfile(targetPc);
+    uint64_t dispatchTraceOrdinal = 0u;
+    const uint32_t traceObjectAddress = GPR_U32(ctx, 4);
+    const bool traceDispatch = beginDispatchTrace(rdram, targetPc, sourcePc,
+                                                  traceObjectAddress, dispatchTraceOrdinal);
+    if (traceDispatch)
+    {
+        logDispatchTrace("entry", rdram, ctx, targetPc, sourcePc,
+                         traceObjectAddress, dispatchTraceOrdinal);
+    }
+    try
+    {
+        targetFn(rdram, ctx, this);
+    }
+    catch (...)
+    {
+        if (profileDispatch)
+        {
+            endDispatchProfile();
+        }
+        throw;
+    }
+    if (profileDispatch)
+    {
+        endDispatchProfile();
+    }
+    if (traceDispatch)
+    {
+        logDispatchTrace("exit", rdram, ctx, targetPc, sourcePc,
+                         traceObjectAddress, dispatchTraceOrdinal);
+    }
 
     if (isStopRequested() || ctx->pc == 0u)
     {
@@ -2301,6 +3106,10 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
 
 void PS2Runtime::run()
 {
+    // The PS2 runs VU/GIF production and GS consumption concurrently. Enable
+    // the strictly ordered worker for live execution; construction-time and
+    // unit-test APIs remain synchronous unless they enter the run loop.
+    m_gs.setAsyncPacketProcessing(std::getenv("PS2X_DISABLE_ASYNC_GS") == nullptr);
     m_stopRequested.store(false, std::memory_order_relaxed);
     ps2_stubs::resetSifState();
     resetIop();
@@ -2345,11 +3154,152 @@ void PS2Runtime::run()
         }
         gameThreadFinished.store(true, std::memory_order_release); });
 
+    static constexpr std::array<uint32_t, 26> movieTraceAddresses = {
+        0x003B72FCu, // middleware object word (state byte is +1)
+        0x003BFCC0u, // subordinate object word (state byte is +1)
+        0x003D01B4u, // source ring +0x0c
+        0x003D01B8u, // source ring +0x10
+        0x003D01BCu, // source ring +0x14
+        0x003C292Cu, // producer payload length
+        0x003C6A20u, // loader flags/state word
+        0x007F81FCu, // request halfwords +0x34/+0x36
+        0x007F8200u, // request halfword +0x38
+        0x01081440u, // movie root word
+        0x01081488u, // stream state
+        0x0108343Cu, // inner stream pointer
+        0x010828ACu, // handle 3 status
+        0x01082920u, // handle 4 status
+        0x01083500u, // slot 6 readiness
+        0x01083544u, // slot 7 readiness
+        0x003EA14Cu, // movie manager lifecycle state
+        0x003EA150u, // movie manager singleton pointer
+        0x010823F4u, // presentation clock (48 kHz units)
+        0x010823F8u, // presentation clock scale
+        0x003BFCECu, // MPEG source position
+        0x003B7230u, // MPEG sample counter
+        0x003B739Cu, // MPEG sample base
+        0x003D01B4u, // active audio-ring cursor
+        0x003D01B8u, // active audio-ring remainder
+        0x003D01F4u, // cathedral audio-ring cursor
+    };
+    static constexpr std::array<const char *, movieTraceAddresses.size()> movieTraceNames = {
+        "middleware", "subordinate", "ring0c", "ring10", "ring14", "producer_len",
+        "loader", "request34_36", "request38", "root", "stream", "inner",
+        "handle3", "handle4", "slot6", "slot7", "manager_state", "manager_ptr",
+        "present_clock", "present_scale", "source_pos", "sample_counter",
+        "sample_base", "audio_cursor", "audio_remainder", "cathedral_cursor",
+    };
+    std::array<uint32_t, movieTraceAddresses.size()> previousMovieTrace{};
+    bool havePreviousMovieTrace = false;
+
+    using HostPresentationClock = std::chrono::steady_clock;
+    constexpr auto hostPresentationInterval = std::chrono::nanoseconds(16683333);
+    auto nextHostPresentation = HostPresentationClock::now();
     uint64_t tick = 0;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        // Service context-owned GPU commands continuously. Presentation and
+        // window polling remain at 59.94 Hz below, so this does not manufacture
+        // guest VBlank progress or render duplicate frames in a tight loop.
+        m_gs.processHostWork();
+        const auto hostNow = HostPresentationClock::now();
+        if (hostNow < nextHostPresentation)
+        {
+            std::this_thread::yield();
+            continue;
+        }
+        do
+        {
+            nextHostPresentation += hostPresentationInterval;
+        } while (nextHostPresentation <= hostNow);
+        tick++;
+        static const bool executionWatchEnabled = []()
+        {
+            const char *value = std::getenv("PS2X_EXECUTION_WATCH");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        }();
+        static const bool executionThreadWatchEnabled = []()
+        {
+            const char *value = std::getenv("PS2X_EXECUTION_WATCH");
+            return value != nullptr && std::strcmp(value, "threads") == 0;
+        }();
+        static const bool movieStateTraceEnabled = []()
+        {
+            const char *value = std::getenv("PS2X_TRACE_MOVIE_STATE");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        }();
+        if (movieStateTraceEnabled)
+        {
+            std::array<uint32_t, movieTraceAddresses.size()> currentMovieTrace{};
+            const uint8_t *const rdram = m_memory.getRDRAM();
+            for (size_t index = 0; index < movieTraceAddresses.size(); ++index)
+                std::memcpy(&currentMovieTrace[index], rdram + movieTraceAddresses[index], sizeof(uint32_t));
+
+            if (!havePreviousMovieTrace || currentMovieTrace != previousMovieTrace)
+            {
+                std::cerr << "[movie:state] host_tick=" << tick
+                          << " vsync_tick=" << m_eeScheduler->currentVSyncTick();
+                for (size_t index = 0; index < movieTraceAddresses.size(); ++index)
+                    std::cerr << ' ' << movieTraceNames[index] << "=0x" << std::hex
+                              << currentMovieTrace[index];
+                std::cerr << std::dec << std::endl;
+                previousMovieTrace = currentMovieTrace;
+                havePreviousMovieTrace = true;
+            }
+        }
+        if (executionWatchEnabled && (tick % 120u) == 0u)
+        {
+            std::cerr << "[execution-watch] host_tick=" << tick
+                      << " vsync_tick=" << m_eeScheduler->currentVSyncTick()
+                      << " pc=0x" << std::hex << m_debugPc.load(std::memory_order_relaxed)
+                      << " ra=0x" << m_debugRa.load(std::memory_order_relaxed)
+                      << " sp=0x" << m_debugSp.load(std::memory_order_relaxed)
+                      << " gp=0x" << m_debugGp.load(std::memory_order_relaxed)
+                      << " v0=0x" << m_debugV0.load(std::memory_order_relaxed)
+                      << " a0=0x" << m_debugA0.load(std::memory_order_relaxed)
+                      << " s0=0x" << m_debugS0.load(std::memory_order_relaxed)
+                      << " s1=0x" << m_debugS1.load(std::memory_order_relaxed)
+                      << std::dec
+                      << " dma=" << m_memory.dmaStartCount()
+                      << " gif=" << m_memory.gifCopyCount()
+                      << " gsw=" << m_memory.gsWriteCount()
+                      << " vif=" << m_memory.vifWriteCount()
+                      << std::endl;
+            if (executionThreadWatchEnabled)
+            {
+                const EeKernelSnapshot snapshot = m_eeScheduler->snapshot();
+                std::cerr << "[execution-watch-threads] running=" << snapshot.runningThreadId
+                          << " ee_cycle=" << snapshot.eeCycle;
+                for (const EeThreadSnapshot &thread : snapshot.threads)
+                {
+                    std::cerr << " id=" << thread.id
+                              << ":pc=0x" << std::hex << thread.pc << std::dec
+                              << ":pri=" << thread.currentPriority
+                              << ":status=" << static_cast<unsigned>(thread.status)
+                              << ":wait=" << static_cast<unsigned>(thread.waitReason)
+                              << ":wid=" << thread.waitId;
+                }
+                std::cerr << std::endl;
+            }
+        }
+#if PS2_RUNTIME_LOGS && !AGRESSIVE_LOGS
+        if ((tick % 120) == 0)
+        {
+            const GSRegisters &gs = m_memory.gs();
+            RUNTIME_LOG("[run:tick] tick=" << tick
+                                           << " pc=0x" << std::hex << m_debugPc.load(std::memory_order_relaxed)
+                                           << " ra=0x" << m_debugRa.load(std::memory_order_relaxed)
+                                           << " dispfb1=0x" << gs.dispfb1
+                                           << " display1=0x" << gs.display1
+                                           << std::dec
+                                           << " dma=" << m_memory.dmaStartCount()
+                                           << " gif=" << m_memory.gifCopyCount()
+                                           << " gsw=" << m_memory.gsWriteCount()
+                                           << " vif=" << m_memory.vifWriteCount()
+                                           << std::endl);
+        }
+#endif
         PS2_IF_AGRESSIVE_LOGS({
-            tick++;
             if ((tick % 120) == 0)
             {
                 uint64_t curDma = m_memory.dmaStartCount();
@@ -2361,6 +3311,10 @@ void PS2Runtime::run()
                 const uint32_t dbgRa = m_debugRa.load(std::memory_order_relaxed);
                 const uint32_t dbgSp = m_debugSp.load(std::memory_order_relaxed);
                 const uint32_t dbgGp = m_debugGp.load(std::memory_order_relaxed);
+                const uint32_t dbgV0 = m_debugV0.load(std::memory_order_relaxed);
+                const uint32_t dbgA0 = m_debugA0.load(std::memory_order_relaxed);
+                const uint32_t dbgS0 = m_debugS0.load(std::memory_order_relaxed);
+                const uint32_t dbgS1 = m_debugS1.load(std::memory_order_relaxed);
                 const auto eeSnapshot = m_eeScheduler->snapshot();
 
                 RUNTIME_LOG("[run:tick] tick=" << tick
@@ -2368,6 +3322,10 @@ void PS2Runtime::run()
                                                << " ra=0x" << dbgRa
                                                << " sp=0x" << dbgSp
                                                << " gp=0x" << dbgGp
+                                               << " v0=0x" << dbgV0
+                                               << " a0=0x" << dbgA0
+                                               << " s0=0x" << dbgS0
+                                               << " s1=0x" << dbgS1
                                                << " dispfb1=0x" << gs.dispfb1
                                                << " display1=0x" << gs.display1
                                                << std::dec
@@ -2377,6 +3335,67 @@ void PS2Runtime::run()
                                                << " gsw=" << curGs
                                                << " vif=" << curVif
                                                << std::endl);
+                for (const auto &thread : eeSnapshot.threads)
+                {
+                    RUNTIME_LOG("[run:thread] id=" << thread.id
+                                                   << " pc=0x" << std::hex << thread.pc
+                                                   << std::dec
+                                                   << " status=" << static_cast<unsigned>(thread.status)
+                                                   << " wait=" << static_cast<unsigned>(thread.waitReason)
+                                                   << " waitId=" << thread.waitId
+                                                   << " priority=" << thread.currentPriority
+                                                   << std::endl);
+                }
+                if (dbgS0 == 0x003B4728u)
+                {
+                    const uint8_t *const object = m_memory.getRDRAM() + dbgS0;
+                    uint32_t words[8]{};
+                    std::memcpy(words, object, sizeof(words));
+                    RUNTIME_LOG("[run:object] address=0x" << std::hex << dbgS0
+                                                        << " bytes=0x" << static_cast<unsigned>(object[0])
+                                                        << ",0x" << static_cast<unsigned>(object[1])
+                                                        << ",0x" << static_cast<unsigned>(object[2])
+                                                        << ",0x" << static_cast<unsigned>(object[3])
+                                                        << " words=0x" << words[0]
+                                                        << ",0x" << words[1]
+                                                        << ",0x" << words[2]
+                                                        << ",0x" << words[3]
+                                                        << ",0x" << words[4]
+                                                        << ",0x" << words[5]
+                                                        << ",0x" << words[6]
+                                                        << ",0x" << words[7]
+                                                        << std::dec << std::endl);
+                    if (words[1] <= PS2_RAM_SIZE - 0x40u)
+                    {
+                        uint32_t linkedWords[12]{};
+                        std::memcpy(linkedWords, m_memory.getRDRAM() + words[1], sizeof(linkedWords));
+                        RUNTIME_LOG("[run:linked-object] address=0x" << std::hex << words[1]
+                                                                  << " words=0x" << linkedWords[0]
+                                                                  << ",0x" << linkedWords[1]
+                                                                  << ",0x" << linkedWords[2]
+                                                                  << ",0x" << linkedWords[3]
+                                                                  << ",0x" << linkedWords[4]
+                                                                  << ",0x" << linkedWords[5]
+                                                                  << ",0x" << linkedWords[6]
+                                                                  << ",0x" << linkedWords[7]
+                                                                  << ",0x" << linkedWords[8]
+                                                                  << ",0x" << linkedWords[9]
+                                                                  << ",0x" << linkedWords[10]
+                                                                  << ",0x" << linkedWords[11]
+                                                                  << std::dec << std::endl);
+                        if (linkedWords[2] <= PS2_RAM_SIZE - 0x80u)
+                        {
+                            uint32_t deviceWords[32]{};
+                            std::memcpy(deviceWords, m_memory.getRDRAM() + linkedWords[2], sizeof(deviceWords));
+                            RUNTIME_LOG("[run:device-object] address=0x" << std::hex << linkedWords[2]);
+                            for (uint32_t deviceWord : deviceWords)
+                            {
+                                RUNTIME_LOG(",0x" << deviceWord);
+                            }
+                            RUNTIME_LOG(std::dec << std::endl);
+                        }
+                    }
+                }
             }
         });
         uint32_t presentWidth = FB_WIDTH;
@@ -2414,6 +3433,7 @@ void PS2Runtime::run()
     }
 
     requestStop();
+    m_gs.processHostWork();
     if (gameThread.joinable())
     {
         gameThread.join();
@@ -2424,6 +3444,8 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
+    m_gs.processHostWork();
+    m_gs.shutdownHostResources();
     UnloadTexture(frameTex);
     CloseWindow();
 

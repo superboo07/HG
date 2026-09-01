@@ -7,6 +7,11 @@
 
 namespace
 {
+    constexpr uint8_t vuLaneForComponent(uint32_t component)
+    {
+        return static_cast<uint8_t>(1u << (3u - component));
+    }
+
     int32_t vuFloatToInt(float value, float scale)
     {
         const double scaled = static_cast<double>(value) * static_cast<double>(scale);
@@ -29,22 +34,116 @@ void VU1Interpreter::execUpper(uint32_t instr)
     uint8_t fs = FS(instr);
     uint8_t fd = FD(instr);
     uint8_t op = instr & 0x3F;
+    const bool isSpecial = op >= 0x3Cu;
+    const uint8_t effectiveOp = isSpecial
+                                    ? static_cast<uint8_t>((instr & 0x3u) | ((instr >> 4) & 0x7Cu))
+                                    : op;
+    if (isSpecial && (effectiveOp == 0x2Fu || effectiveOp == 0x30u))
+        return;
+    if (isSpecial && effectiveOp == 0x1Fu)
+    {
+        uint32_t wBits = 0u;
+        std::memcpy(&wBits, &m_state.vf[ft][3], sizeof(wBits));
+        const int32_t limit = (wBits & 0x7F800000u) != 0u
+                                  ? static_cast<int32_t>(wBits & 0x7FFFFFFFu)
+                                  : 0x007FFFFF;
+        const auto exceedsClipPlane = [limit](float value, uint32_t signMask)
+        {
+            uint32_t bits = 0u;
+            std::memcpy(&bits, &value, sizeof(bits));
+            bits ^= signMask;
+            int32_t orderedBits = 0;
+            std::memcpy(&orderedBits, &bits, sizeof(orderedBits));
+            return orderedBits > limit;
+        };
+        uint32_t flags = 0u;
+        if (exceedsClipPlane(m_state.vf[fs][0], 0x00000000u))
+            flags |= 0x01u;
+        if (exceedsClipPlane(m_state.vf[fs][0], 0x80000000u))
+            flags |= 0x02u;
+        if (exceedsClipPlane(m_state.vf[fs][1], 0x00000000u))
+            flags |= 0x04u;
+        if (exceedsClipPlane(m_state.vf[fs][1], 0x80000000u))
+            flags |= 0x08u;
+        if (exceedsClipPlane(m_state.vf[fs][2], 0x00000000u))
+            flags |= 0x10u;
+        if (exceedsClipPlane(m_state.vf[fs][2], 0x80000000u))
+            flags |= 0x20u;
+        queueClip(flags);
+        return;
+    }
+    const bool usesAcc = (effectiveOp >= 0x08u && effectiveOp <= 0x0Fu) ||
+                         effectiveOp == 0x21u || effectiveOp == 0x23u ||
+                         effectiveOp == 0x25u || effectiveOp == 0x27u ||
+                         effectiveOp == 0x29u || effectiveOp == 0x2Du ||
+                         (!isSpecial && effectiveOp == 0x2Eu);
+    const bool usesQ = effectiveOp == 0x1Cu || effectiveOp == 0x20u ||
+                       effectiveOp == 0x21u || effectiveOp == 0x24u ||
+                       effectiveOp == 0x25u;
+    const bool usesI = effectiveOp == 0x1Eu || effectiveOp == 0x22u ||
+                       effectiveOp == 0x23u || effectiveOp == 0x26u ||
+                       effectiveOp == 0x27u ||
+                       (!isSpecial && (effectiveOp == 0x1Du || effectiveOp == 0x1Fu));
 
+    uint8_t vsMask = dest;
+    uint8_t vtMask = 0u;
+    uint8_t accMask = usesAcc ? dest : 0u;
+    const bool broadcastVt = (!isSpecial && effectiveOp <= 0x1Bu) ||
+                             (isSpecial && (effectiveOp <= 0x0Fu ||
+                                            (effectiveOp >= 0x18u && effectiveOp <= 0x1Bu)));
+    if (broadcastVt)
+    {
+        vtMask = vuLaneForComponent(effectiveOp & 3u);
+    }
+    else if ((!isSpecial && effectiveOp >= 0x28u && effectiveOp <= 0x2Fu) ||
+             (isSpecial && (effectiveOp == 0x28u || effectiveOp == 0x29u ||
+                            effectiveOp == 0x2Au || effectiveOp == 0x2Cu ||
+                            effectiveOp == 0x2Du)))
+    {
+        vtMask = dest;
+    }
+    else if (effectiveOp == 0x2Eu)
+    {
+        static constexpr uint8_t crossLeft[3] = {1u, 2u, 0u};
+        static constexpr uint8_t crossRight[3] = {2u, 0u, 1u};
+        vsMask = 0u;
+        for (uint32_t component = 0u; component < 3u; ++component)
+        {
+            if ((dest & vuLaneForComponent(component)) == 0u)
+                continue;
+            vsMask = static_cast<uint8_t>(vsMask | vuLaneForComponent(crossLeft[component]));
+            vtMask = static_cast<uint8_t>(vtMask | vuLaneForComponent(crossRight[component]));
+        }
+    }
+
+    if (isSpecial && ((effectiveOp >= 0x10u && effectiveOp <= 0x13u) ||
+                      effectiveOp == 0x1Fu || effectiveOp == 0x2Fu ||
+                      effectiveOp == 0x30u || effectiveOp == 0x2Bu ||
+                      effectiveOp > 0x30u))
+    {
+        vsMask = 0u;
+        vtMask = 0u;
+        accMask = 0u;
+    }
     float *vd = m_state.vf[fd];
-    float normalizedVs[4];
-    float normalizedVt[4];
-    float normalizedAcc[4];
+    float normalizedVs[4]{};
+    float normalizedVt[4]{};
+    float normalizedAcc[4]{};
     for (uint32_t component = 0; component < 4u; ++component)
     {
-        normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
-        normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
-        normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
+        const uint8_t lane = vuLaneForComponent(component);
+        if ((vsMask & lane) != 0u)
+            normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
+        if ((vtMask & lane) != 0u)
+            normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
+        if ((accMask & lane) != 0u)
+            normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
     }
     const float *vs = normalizedVs;
     const float *vt = normalizedVt;
     const float *acc = normalizedAcc;
-    const float q = normalizeOperand(m_state.q);
-    const float i = normalizeOperand(m_state.i);
+    const float q = usesQ ? normalizeOperand(m_state.q) : 0.0f;
+    const float i = usesI ? normalizeOperand(m_state.i) : 0.0f;
     float result[4];
 
     // Upper opcode decoding (bits 5:0 of upper word)
@@ -239,7 +338,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x3E:
     case 0x3F:
     {
-        const uint8_t specialOp = static_cast<uint8_t>((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
+        const uint8_t specialOp = effectiveOp;
         float *vtDest = m_state.vf[ft];
 
         switch (specialOp)
@@ -383,37 +482,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
             applyFmacDestAcc(result, dest);
             return;
         case 0x1F: // CLIP
-        {
-            uint32_t wBits = 0u;
-            std::memcpy(&wBits, &m_state.vf[ft][3], sizeof(wBits));
-            const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
-
-            const auto exceedsClipPlane = [limit](float value, uint32_t signMask)
-            {
-                uint32_t bits = 0u;
-                std::memcpy(&bits, &value, sizeof(bits));
-                bits ^= signMask;
-                int32_t orderedBits = 0;
-                std::memcpy(&orderedBits, &bits, sizeof(orderedBits));
-                return orderedBits > limit;
-            };
-
-            uint32_t flags = 0u;
-            if (exceedsClipPlane(m_state.vf[fs][0], 0x00000000u))
-                flags |= 0x01u;
-            if (exceedsClipPlane(m_state.vf[fs][0], 0x80000000u))
-                flags |= 0x02u;
-            if (exceedsClipPlane(m_state.vf[fs][1], 0x00000000u))
-                flags |= 0x04u;
-            if (exceedsClipPlane(m_state.vf[fs][1], 0x80000000u))
-                flags |= 0x08u;
-            if (exceedsClipPlane(m_state.vf[fs][2], 0x00000000u))
-                flags |= 0x10u;
-            if (exceedsClipPlane(m_state.vf[fs][2], 0x80000000u))
-                flags |= 0x20u;
-            queueClip(flags);
+            // Handled before normalized operand preparation.
             return;
-        }
         case 0x20: // ADDAq
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] + q;

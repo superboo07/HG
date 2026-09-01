@@ -14,6 +14,11 @@
 
 #include "ps2_runtime.h"
 
+namespace ps2_stubs
+{
+    void preparePad2DmaRead(uint8_t *rdram, uint32_t address, uint32_t size, uint32_t pc);
+}
+
 static inline int32_t Ps2ExtractEpi32(__m128i v, int index)
 {
     switch (index & 3)
@@ -325,30 +330,40 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
 
 #define READ8(addr) ([&]() -> uint8_t {                       \
     uint32_t _addr = (uint32_t)(addr);                        \
+    ps2_stubs::preparePad2DmaRead(rdram, _addr, 1u, ctx ? ctx->pc : 0u); \
+    ps2TraceGuestRead(rdram, _addr, 1u, "READ8", ctx);       \
     return PS2Runtime::isSpecialAddress(_addr)                \
         ? runtime->Load8(rdram, ctx, _addr)                   \
         : FAST_READ8(_addr); }())
 
 #define READ16(addr) ([&]() -> uint16_t {                     \
     uint32_t _addr = (uint32_t)(addr);                        \
+    ps2_stubs::preparePad2DmaRead(rdram, _addr, 2u, ctx ? ctx->pc : 0u); \
+    ps2TraceGuestRead(rdram, _addr, 2u, "READ16", ctx);      \
     return PS2Runtime::isSpecialAddress(_addr)                \
         ? runtime->Load16(rdram, ctx, _addr)                  \
         : FAST_READ16(_addr); }())
 
 #define READ32(addr) ([&]() -> uint32_t {                     \
     uint32_t _addr = (uint32_t)(addr);                        \
+    ps2_stubs::preparePad2DmaRead(rdram, _addr, 4u, ctx ? ctx->pc : 0u); \
+    ps2TraceGuestRead(rdram, _addr, 4u, "READ32", ctx);      \
     return PS2Runtime::isSpecialAddress(_addr)                \
         ? runtime->Load32(rdram, ctx, _addr)                  \
         : FAST_READ32(_addr); }())
 
 #define READ64(addr) ([&]() -> uint64_t {                     \
     uint32_t _addr = (uint32_t)(addr);                        \
+    ps2_stubs::preparePad2DmaRead(rdram, _addr, 8u, ctx ? ctx->pc : 0u); \
+    ps2TraceGuestRead(rdram, _addr, 8u, "READ64", ctx);      \
     return PS2Runtime::isSpecialAddress(_addr)                \
         ? runtime->Load64(rdram, ctx, _addr)                  \
         : FAST_READ64(_addr); }())
 
 #define READ128(addr) ([&]() -> __m128i {                     \
     uint32_t _addr = (uint32_t)(addr);                        \
+    ps2_stubs::preparePad2DmaRead(rdram, _addr, 16u, ctx ? ctx->pc : 0u); \
+    ps2TraceGuestRead(rdram, _addr, 16u, "READ128", ctx);    \
     return PS2Runtime::isSpecialAddress(_addr)                \
         ? runtime->Load128(rdram, ctx, _addr)                 \
         : FAST_READ128(_addr); }())
@@ -591,17 +606,75 @@ inline __m128i _mm_custom_srav_epi32(__m128i a, __m128i count)
     return _mm_loadu_si128((__m128i *)result);
 }
 
-// PMFHL function implementations
-inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+// PMFHL function implementations. The R5900 exposes two 64-bit HI/LO
+// accumulator pairs. In R5900Context the second pair is stored in hi1/lo1.
+inline __m128i PS2_PMFHL_LW(uint64_t hi, uint64_t lo, uint64_t hi1, uint64_t lo1)
 {
-    return _mm_set1_epi64x(static_cast<long long>(value));
+    return _mm_set_epi32(static_cast<int32_t>(hi1), static_cast<int32_t>(lo1),
+                         static_cast<int32_t>(hi), static_cast<int32_t>(lo));
 }
 
-#define PS2_PMFHL_LW(hi, lo) _mm_unpacklo_epi64(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_UW(hi, lo) _mm_unpackhi_epi64(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_SLW(hi, lo) _mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_LH(hi, lo) _mm_shuffle_epi32(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0))
-#define PS2_PMFHL_SH(hi, lo) _mm_shufflehi_epi16(_mm_shufflelo_epi16(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
+inline __m128i PS2_PMFHL_UW(uint64_t hi, uint64_t lo, uint64_t hi1, uint64_t lo1)
+{
+    return _mm_set_epi32(static_cast<int32_t>(hi1 >> 32), static_cast<int32_t>(lo1 >> 32),
+                         static_cast<int32_t>(hi >> 32), static_cast<int32_t>(lo >> 32));
+}
+
+inline int64_t ps2_pmfhl_accumulator(uint64_t hi, uint64_t lo)
+{
+    const uint64_t bits = ((hi & 0xFFFFFFFFull) << 32) | (lo & 0xFFFFFFFFull);
+    return static_cast<int64_t>(bits);
+}
+
+inline int64_t ps2_pmfhl_saturate_word(int64_t value)
+{
+    if (value > INT32_MAX)
+        return INT32_MAX;
+    if (value < INT32_MIN)
+        return INT32_MIN;
+    return static_cast<int32_t>(value);
+}
+
+inline __m128i PS2_PMFHL_SLW(uint64_t hi, uint64_t lo, uint64_t hi1, uint64_t lo1)
+{
+    return _mm_set_epi64x(ps2_pmfhl_saturate_word(ps2_pmfhl_accumulator(hi1, lo1)),
+                          ps2_pmfhl_saturate_word(ps2_pmfhl_accumulator(hi, lo)));
+}
+
+inline __m128i PS2_PMFHL_LH(uint64_t hi, uint64_t lo, uint64_t hi1, uint64_t lo1)
+{
+    const uint16_t result[8] = {
+        static_cast<uint16_t>(lo), static_cast<uint16_t>(lo >> 32),
+        static_cast<uint16_t>(hi), static_cast<uint16_t>(hi >> 32),
+        static_cast<uint16_t>(lo1), static_cast<uint16_t>(lo1 >> 32),
+        static_cast<uint16_t>(hi1), static_cast<uint16_t>(hi1 >> 32),
+    };
+    return _mm_loadu_si128(reinterpret_cast<const __m128i *>(result));
+}
+
+inline uint16_t ps2_pmfhl_saturate_half(int32_t value)
+{
+    if (value > INT16_MAX)
+        return static_cast<uint16_t>(INT16_MAX);
+    if (value < INT16_MIN)
+        return static_cast<uint16_t>(INT16_MIN);
+    return static_cast<uint16_t>(value);
+}
+
+inline __m128i PS2_PMFHL_SH(uint64_t hi, uint64_t lo, uint64_t hi1, uint64_t lo1)
+{
+    const uint16_t result[8] = {
+        ps2_pmfhl_saturate_half(static_cast<int32_t>(lo)),
+        ps2_pmfhl_saturate_half(static_cast<int32_t>(lo >> 32)),
+        ps2_pmfhl_saturate_half(static_cast<int32_t>(hi)),
+        ps2_pmfhl_saturate_half(static_cast<int32_t>(hi >> 32)),
+        ps2_pmfhl_saturate_half(static_cast<int32_t>(lo1)),
+        ps2_pmfhl_saturate_half(static_cast<int32_t>(lo1 >> 32)),
+        ps2_pmfhl_saturate_half(static_cast<int32_t>(hi1)),
+        ps2_pmfhl_saturate_half(static_cast<int32_t>(hi1 >> 32)),
+    };
+    return _mm_loadu_si128(reinterpret_cast<const __m128i *>(result));
+}
 
 // FPU (COP1) operations
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)

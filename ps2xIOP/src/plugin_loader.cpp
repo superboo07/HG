@@ -596,18 +596,20 @@ namespace ps2x::iop::detail
                     m_host.host.log(LogLevel::Warning, "IOP plugin RPC failed for " + m_name);
                     return {};
                 }
-                return {
-                    result.handled != 0,
-                    result.result_address,
-                    result.signal_nowait_completion != 0,
-                    result.signal_completion != 0,
+                RpcResult translated{};
+                translated.handled = result.handled != 0;
+                translated.resultAddress = result.result_address;
+                translated.signalNowaitCompletion = result.signal_nowait_completion != 0;
+                translated.signalCompletion = result.signal_completion != 0;
+                translated.callbackPolicy =
                     result.callback_policy == PS2X_IOP_CALLBACK_SUPPRESS_V1
                         ? CallbackPolicy::Suppress
-                        : CallbackPolicy::RuntimeDefault,
+                        : CallbackPolicy::RuntimeDefault;
+                translated.serverDispatchPolicy =
                     result.server_dispatch_policy == PS2X_IOP_SERVER_DISPATCH_SUPPRESS_V1
                         ? ServerDispatchPolicy::Suppress
-                        : ServerDispatchPolicy::RuntimeDefault,
-                };
+                        : ServerDispatchPolicy::RuntimeDefault;
+                return translated;
             }
 
             void onSifTransfer(const SifTransfer &transfer) override

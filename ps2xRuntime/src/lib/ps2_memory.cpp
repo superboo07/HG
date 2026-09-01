@@ -3,15 +3,130 @@
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <algorithm>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace
 {
+    struct GifPacketDump
+    {
+        std::mutex mutex;
+        std::ofstream stream;
+        std::chrono::steady_clock::time_point epoch = std::chrono::steady_clock::now();
+        double delaySeconds = 0.0;
+        double durationSeconds = 10.0;
+        uint64_t byteLimit = 64ull * 1024ull * 1024ull;
+        uint64_t bytesWritten = 0u;
+        uint64_t ordinal = 0u;
+        int pathFilter = -1;
+        bool configured = false;
+        bool finished = false;
+
+        void configure()
+        {
+            configured = true;
+            const char *path = std::getenv("PS2X_GIF_PACKET_DUMP");
+            if (!path || !*path)
+            {
+                finished = true;
+                return;
+            }
+
+            if (const char *value = std::getenv("PS2X_GIF_PACKET_DUMP_DELAY_SECONDS"))
+                delaySeconds = std::max(0.0, std::strtod(value, nullptr));
+            if (const char *value = std::getenv("PS2X_GIF_PACKET_DUMP_DURATION_SECONDS"))
+                durationSeconds = std::max(0.0, std::strtod(value, nullptr));
+            if (const char *value = std::getenv("PS2X_GIF_PACKET_DUMP_MAX_BYTES"))
+                byteLimit = std::strtoull(value, nullptr, 0);
+            if (const char *value = std::getenv("PS2X_GIF_PACKET_DUMP_PATH"))
+            {
+                const long parsed = std::strtol(value, nullptr, 0);
+                if (parsed >= 1 && parsed <= 3)
+                    pathFilter = static_cast<int>(parsed);
+            }
+
+            stream.open(path, std::ios::binary | std::ios::trunc);
+            if (!stream)
+            {
+                std::cerr << "[gif-packet-dump] unable to open " << path << std::endl;
+                finished = true;
+                return;
+            }
+
+            static constexpr char kHeader[8] = {'P', '2', 'G', 'I', 'F', '0', '0', '1'};
+            stream.write(kHeader, sizeof(kHeader));
+            bytesWritten = sizeof(kHeader);
+            std::cerr << "[gif-packet-dump] path=" << path
+                      << " delay_seconds=" << delaySeconds
+                      << " duration_seconds=" << durationSeconds
+                      << " byte_limit=" << byteLimit
+                      << " path_filter=" << pathFilter << std::endl;
+        }
+
+        void record(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes,
+                    bool drainImmediately, bool path2DirectHl)
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!configured)
+                configure();
+            if (finished)
+                return;
+            if (pathFilter >= 0 && static_cast<int>(pathId) != pathFilter)
+                return;
+
+            const double elapsedSeconds = std::chrono::duration<double>(
+                                              std::chrono::steady_clock::now() - epoch)
+                                              .count();
+            if (elapsedSeconds < delaySeconds)
+                return;
+            if (durationSeconds > 0.0 && elapsedSeconds >= delaySeconds + durationSeconds)
+            {
+                finished = true;
+                stream.flush();
+                return;
+            }
+
+            constexpr uint64_t kRecordHeaderBytes = 24u;
+            if (byteLimit != 0u && bytesWritten + kRecordHeaderBytes + sizeBytes > byteLimit)
+            {
+                finished = true;
+                stream.flush();
+                std::cerr << "[gif-packet-dump] byte limit reached after " << ordinal
+                          << " packets" << std::endl;
+                return;
+            }
+
+            const uint8_t flags[4] = {
+                static_cast<uint8_t>(pathId),
+                static_cast<uint8_t>(path2DirectHl ? 1u : 0u),
+                static_cast<uint8_t>(drainImmediately ? 1u : 0u),
+                0u};
+            const uint64_t elapsedNanoseconds = static_cast<uint64_t>(elapsedSeconds * 1.0e9);
+            stream.write(reinterpret_cast<const char *>(flags), sizeof(flags));
+            stream.write(reinterpret_cast<const char *>(&sizeBytes), sizeof(sizeBytes));
+            stream.write(reinterpret_cast<const char *>(&ordinal), sizeof(ordinal));
+            stream.write(reinterpret_cast<const char *>(&elapsedNanoseconds), sizeof(elapsedNanoseconds));
+            stream.write(reinterpret_cast<const char *>(data), sizeBytes);
+            bytesWritten += kRecordHeaderBytes + sizeBytes;
+            ++ordinal;
+        }
+    };
+
+    GifPacketDump &gifPacketDump()
+    {
+        static GifPacketDump dump;
+        return dump;
+    }
+
     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
     {
         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) > static_cast<uint64_t>(regionSize))
@@ -329,8 +444,11 @@ bool PS2Memory::initialize(size_t ramSize)
     m_codeRegions.clear();
     m_path3Masked = false;
     m_path3MaskedFifo.clear();
+    m_vif1PendingDirectQwc = 0u;
+    m_vif1PendingDirectHl = false;
     m_vif1PendingPath2ImageQwc = 0u;
     m_vif1PendingPath2DirectHl = false;
+    m_ipuToDmaState = {};
     resetEeTimers();
 
     try
@@ -1195,6 +1313,27 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         return true;
     }
 
+    static constexpr uint32_t IPU_TO_CHANNEL = 0x1000B400u;
+    if (address >= IPU_TO_CHANNEL && address < IPU_TO_CHANNEL + 0x100u)
+    {
+        const uint32_t offset = address - IPU_TO_CHANNEL;
+        const uint32_t currentChcr = m_ioRegisters.count(IPU_TO_CHANNEL)
+                                         ? m_ioRegisters[IPU_TO_CHANNEL]
+                                         : 0u;
+        if (offset == 0u && (currentChcr & 0x100u) != 0u)
+        {
+            // An active DMAC channel ignores restart/configuration writes. A
+            // write which clears STR is the explicit force-stop operation.
+            if ((value & 0x100u) != 0u)
+                return true;
+            m_ioRegisters[IPU_TO_CHANNEL] = value & ~0x100u;
+            m_ipuToDmaState = {};
+            return true;
+        }
+        if (offset == 0x20u)
+            value &= 0xFFFFu;
+    }
+
     m_ioRegisters[address] = value;
 
     if (address >= 0x10003C00u && address < 0x10003E00u)
@@ -1207,6 +1346,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             if (value & 0x1u) // RST
             {
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
+                m_vif1PendingDirectQwc = 0u;
+                m_vif1PendingDirectHl = false;
                 m_vif1PendingPath2ImageQwc = 0u;
                 m_vif1PendingPath2DirectHl = false;
             }
@@ -1281,13 +1422,54 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
 
-            if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) &&
+            if (channelBase == 0x1000B400u && std::getenv("PS2X_TRACE_IPU_DMA") != nullptr)
+            {
+                const uint32_t tadr = m_ioRegisters[channelBase + 0x30];
+                std::cerr << "[ipu-dma] chcr=0x" << std::hex << value
+                          << " madr=0x" << madr
+                          << " qwc=0x" << qwc
+                          << " tadr=0x" << tadr << std::dec << std::endl;
+            }
+
+            if (channelBase == IPU_TO_CHANNEL)
+            {
+                m_ipuToDmaState = {};
+                m_ipuToDmaState.chainMode = (((value >> 2u) & 0x3u) == 1u);
+                // A source chain may be force-stopped after partially draining
+                // a tag, then resumed from the guest-visible MADR/QWC/TADR
+                // registers.  TADR already names the following tag in that
+                // state, so consume the restored payload before fetching it.
+                m_ipuToDmaState.tagInProgress =
+                    m_ipuToDmaState.chainMode && ((qwc & 0xFFFFu) != 0u);
+                pumpIpuToDma(8u);
+                return true;
+            }
+
+            // DMAC channel 4 transfers compressed MPEG bitstream data from EE
+            // memory to the IPU. The native MPEG decoder consumes the same
+            // bytes at this hardware seam because the host runtime does not
+            // emulate the IPU bitstream FIFO itself.
+            if ((channelBase == 0x1000A000u || channelBase == 0x10009000u ||
+                 channelBase == 0x10008000u) &&
                 (m_gsVRAM || channelBase == 0x10008000u))
             {
                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
                 {
                     if (qwCount == 0)
                         return;
+                    if (std::getenv("PS2X_TRACE_GS_MOVIE_DMA") != nullptr &&
+                        channelBase == 0x1000A000u &&
+                        qwCount >= 0x700u && qwCount <= 0x710u)
+                    {
+                        static std::atomic<uint32_t> movieNormalTraceCount{0u};
+                        const uint32_t traceIndex = movieNormalTraceCount.fetch_add(1u, std::memory_order_relaxed);
+                        if (traceIndex < 128u)
+                        {
+                            std::cerr << "[gs-movie-normal] index=" << traceIndex
+                                      << " src=0x" << std::hex << srcAddr
+                                      << " qwc=0x" << qwCount << std::dec << std::endl;
+                        }
+                    }
                     const bool scratch = isScratchpad(srcAddr);
                     PendingTransfer pt;
                     pt.fromScratchpad = scratch;
@@ -1315,8 +1497,39 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    const bool transferVifTag =
+                        (chcr & (1u << 6)) != 0u &&
+                        (channelBase == 0x10008000u || channelBase == 0x10009000u);
                     std::vector<uint8_t> chainBuf;
+
+                    struct ChainTraversalState
+                    {
+                        uint32_t tagAddr;
+                        uint32_t asr0;
+                        uint32_t asr1;
+                        uint32_t asp;
+
+                        bool operator==(const ChainTraversalState &other) const
+                        {
+                            return tagAddr == other.tagAddr && asr0 == other.asr0 &&
+                                   asr1 == other.asr1 && asp == other.asp;
+                        }
+                    };
+
+                    struct ChainTraversalStateHash
+                    {
+                        size_t operator()(const ChainTraversalState &state) const
+                        {
+                            size_t hash = static_cast<size_t>(state.tagAddr);
+                            hash ^= static_cast<size_t>(state.asr0) + 0x9E3779B9u + (hash << 6u) + (hash >> 2u);
+                            hash ^= static_cast<size_t>(state.asr1) + 0x9E3779B9u + (hash << 6u) + (hash >> 2u);
+                            hash ^= static_cast<size_t>(state.asp) + 0x9E3779B9u + (hash << 6u) + (hash >> 2u);
+                            return hash;
+                        }
+                    };
+
+                    std::unordered_set<ChainTraversalState, ChainTraversalStateHash> visitedChainStates;
+                    visitedChainStates.reserve(16384u);
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1353,7 +1566,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         }
                     };
 
-                    auto appendCompactVif1TagData = [&](uint32_t localTagAddr, uint32_t qwCount)
+                    auto appendVifTagData = [&](uint32_t localTagAddr)
                     {
                         uint32_t tagPhys = 0u;
                         const bool tagScratch = isScratchpad(localTagAddr);
@@ -1364,16 +1577,23 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         if (tagPhys + 16u > localMax)
                             return;
 
-                        // VIF packet helpers embed 8 bytes of VIF stream in the DMAtag's upper half.
+                        // With TTE set, the upper 64 bits of every source-chain DMAtag
+                        // are transferred to VIF before that tag's data payload.
                         chainBuf.insert(chainBuf.end(), localBase + tagPhys + 8u, localBase + tagPhys + 16u);
-                        appendData(localTagAddr + 16u, qwCount);
                     };
 
-                    int tagsProcessed = 0;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
 
-                    while (tagsProcessed < kMaxChainTags)
+                    while (true)
                     {
+                        const ChainTraversalState traversalState{tagAddr, asr0, asr1, asp};
+                        if (!visitedChainStates.insert(traversalState).second)
+                        {
+                            std::cerr << "[dma-chain] repeated traversal state at tag 0x"
+                                      << std::hex << tagAddr << std::dec << std::endl;
+                            break;
+                        }
+
                         const uint32_t currentTagAddr = tagAddr;
                         const bool tagInSPR = isScratchpad(tagAddr);
                         uint32_t physTag = 0;
@@ -1407,8 +1627,6 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
                         uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
-                        ++tagsProcessed;
-
                         uint32_t dataAddr = 0;
                         bool hasPayload = (tagQwc > 0);
                         bool endChain = false;
@@ -1477,19 +1695,47 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                         }
 
-                        const bool compactVifLocalTag =
-                            (channelBase == 0x10009000u || channelBase == 0x10008000u) &&
-                            (id == 1u || id == 2u || id == 5u || id == 6u || id == 7u);
-                        if (compactVifLocalTag)
-                            appendCompactVif1TagData(currentTagAddr, 0u);
+                        if (std::getenv("PS2X_TRACE_GS_MOVIE_DMA") != nullptr &&
+                            channelBase == 0x1000A000u &&
+                            tagQwc == 16u * 448u * 4u / 16u)
+                        {
+                            static std::atomic<uint32_t> movieChainTraceCount{0u};
+                            const uint32_t traceIndex = movieChainTraceCount.fetch_add(1u, std::memory_order_relaxed);
+                            if (traceIndex < 128u)
+                            {
+                                std::cerr << "[gs-movie-chain] index=" << traceIndex
+                                          << " tag=0x" << std::hex << currentTagAddr
+                                          << " id=0x" << id
+                                          << " addr=0x" << addr
+                                          << " data=0x" << dataAddr
+                                          << " qwc=0x" << tagQwc << std::dec << std::endl;
+                            }
+                        }
+
+                        if (std::getenv("PS2X_TRACE_GS_MOVIE_DMA") != nullptr &&
+                            channelBase == 0x10009000u &&
+                            tagQwc >= 0x700u && tagQwc <= 0x710u)
+                        {
+                            static std::atomic<uint32_t> movieVifChainTraceCount{0u};
+                            const uint32_t traceIndex = movieVifChainTraceCount.fetch_add(1u, std::memory_order_relaxed);
+                            if (traceIndex < 128u)
+                            {
+                                std::cerr << "[gs-movie-vif-chain] index=" << traceIndex
+                                          << " tag=0x" << std::hex << currentTagAddr
+                                          << " id=0x" << id
+                                          << " addr=0x" << addr
+                                          << " data=0x" << dataAddr
+                                          << " w2=0x" << loadScalar<uint32_t>(tp, 8u, 16u, "movie VIF tag w2", currentTagAddr)
+                                          << " w3=0x" << loadScalar<uint32_t>(tp, 12u, 16u, "movie VIF tag w3", currentTagAddr)
+                                          << " qwc=0x" << tagQwc << std::dec << std::endl;
+                            }
+                        }
+
+                        if (transferVifTag)
+                            appendVifTagData(currentTagAddr);
 
                         if (hasPayload)
-                        {
-                            if (compactVifLocalTag)
-                                appendData(currentTagAddr + 16u, tagQwc);
-                            else
-                                appendData(dataAddr, tagQwc);
-                        }
+                            appendData(dataAddr, tagQwc);
                         if (irq && tieEnabled)
                             endChain = true;
                         if (endChain)
@@ -1559,8 +1805,232 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     return false;
 }
 
+void PS2Memory::completeIpuToDma()
+{
+    static constexpr uint32_t IPU_TO_CHANNEL = 0x1000B400u;
+    static constexpr uint32_t D_STAT = 0x1000E010u;
+
+    m_ioRegisters[IPU_TO_CHANNEL] &= ~0x100u;
+    m_ioRegisters[IPU_TO_CHANNEL + 0x20u] = 0u;
+    m_ipuToDmaState = {};
+
+    uint32_t dstat = m_ioRegisters.count(D_STAT) ? m_ioRegisters[D_STAT] : 0u;
+    dstat |= (1u << 4u);
+    const uint32_t status = dstat & 0x3FFu;
+    const uint32_t mask = (dstat >> 16u) & 0x3FFu;
+    if ((status & mask) != 0u)
+        dstat |= (1u << 31u);
+    else
+        dstat &= ~(1u << 31u);
+    m_ioRegisters[D_STAT] = dstat;
+    queueCompletedDmacCause(4u);
+    if (m_ipuToDmaCompletionCallback)
+        m_ipuToDmaCompletionCallback();
+}
+
+uint32_t PS2Memory::pumpIpuToDma(uint32_t maxQwc)
+{
+    static constexpr uint32_t IPU_TO_CHANNEL = 0x1000B400u;
+    if (maxQwc == 0u || (m_ioRegisters[IPU_TO_CHANNEL] & 0x100u) == 0u)
+        return 0u;
+
+    uint32_t transferredTotal = 0u;
+    uint32_t emptyTagsVisited = 0u;
+    while ((m_ioRegisters[IPU_TO_CHANNEL] & 0x100u) != 0u &&
+           transferredTotal < maxQwc)
+    {
+        if (m_ipuToDmaState.chainMode && !m_ipuToDmaState.tagInProgress)
+        {
+            if (++emptyTagsVisited > 4096u)
+            {
+                std::cerr << "[ipu-dma] source chain exceeded tag traversal limit" << std::endl;
+                completeIpuToDma();
+                break;
+            }
+
+            const uint32_t tagAddress = m_ioRegisters[IPU_TO_CHANNEL + 0x30u];
+            uint64_t tag = 0u;
+            try
+            {
+                tag = read64(tagAddress);
+            }
+            catch (const std::exception &e)
+            {
+                std::cerr << "[ipu-dma] invalid source-chain tag at 0x" << std::hex
+                          << tagAddress << std::dec << ": " << e.what() << std::endl;
+                completeIpuToDma();
+                break;
+            }
+
+            const uint32_t tagQwc = static_cast<uint32_t>(tag & 0xFFFFu);
+            const uint32_t tagId = static_cast<uint32_t>((tag >> 28u) & 0x7u);
+            const bool tagIrq = ((tag >> 31u) & 0x1u) != 0u;
+            const uint32_t tagTarget = static_cast<uint32_t>((tag >> 32u) & 0x7FFFFFF0u);
+            uint32_t nextTag = tagAddress + 16u;
+            uint32_t dataAddress = 0u;
+            bool terminal = false;
+
+            uint32_t chcr = m_ioRegisters[IPU_TO_CHANNEL];
+            uint32_t asp = (chcr >> 4u) & 0x3u;
+            uint32_t asr0 = m_ioRegisters[IPU_TO_CHANNEL + 0x40u];
+            uint32_t asr1 = m_ioRegisters[IPU_TO_CHANNEL + 0x50u];
+            switch (tagId)
+            {
+            case 0u: // REFE
+                dataAddress = tagTarget;
+                terminal = true;
+                break;
+            case 1u: // CNT
+                dataAddress = tagAddress + 16u;
+                nextTag = dataAddress + tagQwc * 16u;
+                break;
+            case 2u: // NEXT
+                dataAddress = tagAddress + 16u;
+                nextTag = tagTarget;
+                break;
+            case 3u: // REF
+            case 4u: // REFS
+                dataAddress = tagTarget;
+                break;
+            case 5u: // CALL
+                dataAddress = tagAddress + 16u;
+                if (asp == 0u)
+                {
+                    asr0 = dataAddress + tagQwc * 16u;
+                    asp = 1u;
+                }
+                else if (asp == 1u)
+                {
+                    asr1 = dataAddress + tagQwc * 16u;
+                    asp = 2u;
+                }
+                nextTag = tagTarget;
+                break;
+            case 6u: // RET
+                dataAddress = tagAddress + 16u;
+                if (asp == 2u)
+                {
+                    nextTag = asr1;
+                    asp = 1u;
+                }
+                else if (asp == 1u)
+                {
+                    nextTag = asr0;
+                    asp = 0u;
+                }
+                else
+                {
+                    terminal = true;
+                }
+                break;
+            case 7u: // END
+                dataAddress = tagAddress + 16u;
+                terminal = true;
+                break;
+            }
+
+            if (tagIrq && (chcr & (1u << 7u)) != 0u)
+                terminal = true;
+
+            chcr = (chcr & ~(0x3u << 4u)) | ((asp & 0x3u) << 4u);
+            chcr = (chcr & 0x0000FFFFu) |
+                   (static_cast<uint32_t>((tag >> 16u) & 0xFFFFu) << 16u);
+            m_ioRegisters[IPU_TO_CHANNEL] = chcr;
+            m_ioRegisters[IPU_TO_CHANNEL + 0x10u] = dataAddress;
+            m_ioRegisters[IPU_TO_CHANNEL + 0x20u] = tagQwc;
+            m_ioRegisters[IPU_TO_CHANNEL + 0x30u] = nextTag;
+            m_ioRegisters[IPU_TO_CHANNEL + 0x40u] = asr0;
+            m_ioRegisters[IPU_TO_CHANNEL + 0x50u] = asr1;
+            m_ipuToDmaState.tagInProgress = tagQwc != 0u;
+            m_ipuToDmaState.endAfterPayload = terminal;
+
+            if (std::getenv("PS2X_TRACE_IPU_DMA") != nullptr)
+            {
+                std::cerr << "[ipu-dma-tag] tag=0x" << std::hex << tagAddress
+                          << " id=" << std::dec << tagId
+                          << " qwc=0x" << std::hex << tagQwc
+                          << " addr=0x" << tagTarget
+                          << " data=0x" << dataAddress
+                          << " next=0x" << nextTag
+                          << " irq=" << std::dec << (tagIrq ? 1 : 0)
+                          << " end=" << (terminal ? 1 : 0) << std::endl;
+            }
+
+            if (tagQwc == 0u)
+            {
+                if (terminal)
+                {
+                    completeIpuToDma();
+                    break;
+                }
+                continue;
+            }
+        }
+
+        uint32_t qwc = m_ioRegisters[IPU_TO_CHANNEL + 0x20u] & 0xFFFFu;
+        if (qwc == 0u)
+        {
+            if (!m_ipuToDmaState.chainMode || m_ipuToDmaState.endAfterPayload)
+                completeIpuToDma();
+            else
+                m_ipuToDmaState.tagInProgress = false;
+            continue;
+        }
+        if (!m_ipuToDmaCallback)
+            break;
+
+        const uint32_t accepted = std::min(qwc, maxQwc - transferredTotal);
+        const uint32_t madr = m_ioRegisters[IPU_TO_CHANNEL + 0x10u];
+        m_ipuToDmaCallback(madr, accepted);
+        m_ioRegisters[IPU_TO_CHANNEL + 0x10u] = madr + accepted * 16u;
+        m_ioRegisters[IPU_TO_CHANNEL + 0x20u] = qwc - accepted;
+        transferredTotal += accepted;
+
+        if (accepted == qwc)
+        {
+            m_ipuToDmaState.tagInProgress = false;
+            if (!m_ipuToDmaState.chainMode || m_ipuToDmaState.endAfterPayload)
+                completeIpuToDma();
+        }
+    }
+    return transferredTotal;
+}
+
 void PS2Memory::processPendingTransfers()
 {
+    static const auto transferProfileEpoch = std::chrono::steady_clock::now();
+    static const double transferProfileDelaySeconds = [] {
+        const char *text = std::getenv("PS2X_TRANSFER_PROFILE_DELAY_SECONDS");
+        if (!text || text[0] == '\0')
+            return 0.0;
+        char *end = nullptr;
+        const double parsed = std::strtod(text, &end);
+        return end != text && *end == '\0' && parsed > 0.0 ? parsed : 0.0;
+    }();
+    const bool profileTransfers = std::getenv("PS2X_TRANSFER_PROFILE") != nullptr &&
+                                  std::chrono::duration<double>(
+                                      std::chrono::steady_clock::now() - transferProfileEpoch)
+                                          .count() >= transferProfileDelaySeconds;
+    const auto profileStart = profileTransfers ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
+    const auto queuedBytes = [](const auto &transfers)
+    {
+        uint64_t total = 0u;
+        for (const auto &transfer : transfers)
+        {
+            total += !transfer.chainData.empty()
+                         ? static_cast<uint64_t>(transfer.chainData.size())
+                         : static_cast<uint64_t>(transfer.qwc) * 16ull;
+        }
+        return total;
+    };
+    const size_t gifTransferCount = m_pendingGifTransfers.size();
+    const size_t vif0TransferCount = m_pendingVif0Transfers.size();
+    const size_t vif1TransferCount = m_pendingVif1Transfers.size();
+    const uint64_t gifBytes = profileTransfers ? queuedBytes(m_pendingGifTransfers) : 0u;
+    const uint64_t vif0Bytes = profileTransfers ? queuedBytes(m_pendingVif0Transfers) : 0u;
+    const uint64_t vif1Bytes = profileTransfers ? queuedBytes(m_pendingVif1Transfers) : 0u;
+
     const bool hadGif = !m_pendingGifTransfers.empty();
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
     {
@@ -1625,6 +2095,8 @@ void PS2Memory::processPendingTransfers()
         }
     }
     m_pendingGifTransfers.clear();
+    const auto gifEnd = profileTransfers ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
 
     const bool hadVif0 = !m_pendingVif0Transfers.empty();
     for (auto &p : m_pendingVif0Transfers)
@@ -1683,6 +2155,8 @@ void PS2Memory::processPendingTransfers()
         }
     }
     m_pendingVif0Transfers.clear();
+    const auto vif0End = profileTransfers ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
     for (auto &p : m_pendingVif1Transfers)
@@ -1741,9 +2215,35 @@ void PS2Memory::processPendingTransfers()
         }
     }
     m_pendingVif1Transfers.clear();
+    const auto vif1End = profileTransfers ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
 
     if (m_gifArbiter)
         m_gifArbiter->drain();
+    const auto drainEnd = profileTransfers ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+
+    if (profileTransfers)
+    {
+        const double gifMs = std::chrono::duration<double, std::milli>(gifEnd - profileStart).count();
+        const double vif0Ms = std::chrono::duration<double, std::milli>(vif0End - gifEnd).count();
+        const double vif1Ms = std::chrono::duration<double, std::milli>(vif1End - vif0End).count();
+        const double drainMs = std::chrono::duration<double, std::milli>(drainEnd - vif1End).count();
+        if (gifMs + vif0Ms + vif1Ms + drainMs >= 1.0)
+        {
+            std::cerr << "[transfer-profile] gif_count=" << gifTransferCount
+                      << " gif_bytes=" << gifBytes
+                      << " gif_ms=" << gifMs
+                      << " vif0_count=" << vif0TransferCount
+                      << " vif0_bytes=" << vif0Bytes
+                      << " vif0_ms=" << vif0Ms
+                      << " vif1_count=" << vif1TransferCount
+                      << " vif1_bytes=" << vif1Bytes
+                      << " vif1_ms=" << vif1Ms
+                      << " drain_ms=" << drainMs
+                      << std::endl;
+        }
+    }
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
     static constexpr uint32_t VIF0_CHANNEL = 0x10008000;
@@ -1830,6 +2330,31 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 {
     if (!data || sizeBytes < 16)
         return;
+
+    gifPacketDump().record(pathId, data, sizeBytes, drainImmediately, path2DirectHl);
+
+    if (std::getenv("PS2X_TRACE_GS_MOVIE_DMA") != nullptr && sizeBytes >= 16u)
+    {
+        uint64_t tagLo = 0u;
+        std::memcpy(&tagLo, data, sizeof(tagLo));
+        const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+        const uint32_t flg = static_cast<uint32_t>((tagLo >> 58u) & 0x3u);
+        if ((flg == GIF_FMT_IMAGE || flg == GIF_FMT_IMAGE2) && nloop == 0x700u)
+        {
+            static std::atomic<uint32_t> moviePacketTraceCount{0u};
+            const uint32_t traceIndex = moviePacketTraceCount.fetch_add(1u, std::memory_order_relaxed);
+            if (traceIndex < 128u)
+            {
+                std::cerr << "[gs-movie-packet] index=" << traceIndex
+                          << " path=" << static_cast<uint32_t>(pathId)
+                          << " bytes=0x" << std::hex << sizeBytes
+                          << " nloop=0x" << nloop
+                          << " flg=0x" << flg
+                          << " directhl=" << std::dec << (path2DirectHl ? 1 : 0)
+                          << " drain=" << (drainImmediately ? 1 : 0) << std::endl;
+            }
+        }
+    }
 
     if (pathId == GifPathId::Path3)
     {
@@ -1999,7 +2524,7 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
         return false;
 
     const uint64_t imageTagLo = loadScalar<uint64_t>(imageGifTag, 0u, 16u, "native gif image tag", imageTagDmaAddr + 16u);
-    if (gifTagFlg(imageTagLo) != GIF_FMT_IMAGE)
+    if (gifTagFlg(imageTagLo) != GIF_FMT_IMAGE && gifTagFlg(imageTagLo) != GIF_FMT_IMAGE2)
         return false;
 
     const uint32_t imageQwc = gifTagNloop(imageTagLo);
@@ -2051,6 +2576,36 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     const uint8_t *imageData = nullptr;
     if (!resolveContiguous(imageDataAddr, imageBytes, imageData))
         return false;
+
+    if (std::getenv("PS2X_TRACE_GS_MOVIE_DMA") != nullptr)
+    {
+        const uint32_t rrw = static_cast<uint32_t>(setupRegs[2] & 0xFFFull);
+        const uint32_t rrh = static_cast<uint32_t>((setupRegs[2] >> 32u) & 0xFFFull);
+        if (rrw == 16u && rrh == 448u)
+        {
+            static std::atomic<uint32_t> movieDmaTraceCount{0u};
+            const uint32_t traceIndex = movieDmaTraceCount.fetch_add(1u, std::memory_order_relaxed);
+            if (traceIndex < 128u)
+            {
+                const uint32_t dsax = static_cast<uint32_t>(setupRegs[1] & 0x7FFull);
+                uint64_t hash = 1469598103934665603ull;
+                for (uint32_t index = 0u; index < imageBytes; ++index)
+                {
+                    hash ^= imageData[index];
+                    hash *= 1099511628211ull;
+                }
+                std::cerr << "[gs-movie-dma] index=" << traceIndex
+                          << " tadr=0x" << std::hex << tadr
+                          << " payload_tag=0x" << payloadTagAddr
+                          << " tag_id=0x" << static_cast<uint32_t>(payloadTag.id)
+                          << " tag_addr=0x" << payloadTag.addr
+                          << " data=0x" << imageDataAddr
+                          << " dsax=0x" << dsax
+                          << " bytes=0x" << imageBytes
+                          << " hash=0x" << hash << std::dec << std::endl;
+            }
+        }
+    }
 
     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
     m_seenGifCopy = true;
@@ -2227,6 +2782,8 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         {
             if ((address & 0xFF) == 0x00)
             {
+                if (address == 0x1000B400u)
+                    return m_ioRegisters[address];
                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
                 m_ioRegisters[address] = channelStatus;
                 return channelStatus;

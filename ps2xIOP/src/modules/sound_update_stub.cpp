@@ -3,7 +3,10 @@
 #include <array>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <iomanip>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
@@ -70,6 +73,37 @@ namespace ps2x::iop::detail
                     request.receive.address != 0u && request.receive.size != 0u)
                 {
                     (void)m_host.zeroGuest(request.receive.address, request.receive.size);
+                }
+
+                // Preserve the portable host-audio seam even when a game's IOP
+                // driver protocol is only partially characterized.
+                m_host.audioCommand(request.sid,
+                                    request.function,
+                                    request.send,
+                                    request.receive);
+
+                if (std::getenv("PS2X_SOUND_UPDATE_TRACE") != nullptr)
+                {
+                    constexpr size_t kPreviewBytes = 96u;
+                    std::array<uint8_t, kPreviewBytes> preview{};
+                    const size_t previewSize = std::min<size_t>(request.send.size, preview.size());
+                    if (previewSize != 0u)
+                    {
+                        (void)m_host.readGuest(request.send.address, preview.data(), previewSize);
+                    }
+                    std::ostringstream message;
+                    message << "SNDDRV update function=0x" << std::hex << request.function
+                            << " send=0x" << request.send.address
+                            << " send_size=0x" << request.send.size
+                            << " receive=0x" << request.receive.address
+                            << " receive_size=0x" << request.receive.size
+                            << " preview=";
+                    for (size_t index = 0u; index < previewSize; ++index)
+                    {
+                        message << std::setw(2) << std::setfill('0')
+                                << static_cast<unsigned int>(preview[index]);
+                    }
+                    m_host.log(LogLevel::Info, message.str());
                 }
 
                 std::vector<uint32_t> activeStreamSlots;

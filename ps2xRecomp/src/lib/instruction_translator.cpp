@@ -70,7 +70,10 @@ namespace ps2recomp
     MemoryAccessHint InstructionTranslator::effectiveMemoryHintFor(const Instruction &inst, const MemoryAccessHint &memoryHint) const
     {
         MemoryAccessHint effectiveMemoryHint = memoryHint;
-        if (inst.isMmio)
+        // The analyzer's MMIO annotation can be conservative (for example it
+        // may retain only a preceding LUI value). Prefer the emitter's exact
+        // LUI/ORI-derived address whenever that local proof is available.
+        if (inst.isMmio && !effectiveMemoryHint.hasAddress)
         {
             effectiveMemoryHint.hasAddress = true;
             effectiveMemoryHint.address = inst.mmioAddress;

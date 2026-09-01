@@ -22,6 +22,7 @@ using namespace ps2_syscalls;
 namespace ps2_stubs
 {
     void resetSifState();
+    bool writeSifIopHeap(uint32_t address, const void *source, size_t size);
 }
 
 namespace
@@ -35,6 +36,7 @@ namespace
     constexpr uint32_t IOP_SID_SNDDRV_STATE = 0x00000001u;
     constexpr uint32_t IOP_SID_LOTR_CLFILE = 0x0000FF01u;
     constexpr uint32_t IOP_SID_LOTR_SOUND = 0x00012345u;
+    constexpr uint32_t IOP_SID_HG_SNDDRV_TRANSFER = 0x77777778u;
     constexpr uint32_t IOP_SID_MCSERV = 0x80000400u;
     constexpr uint32_t IOP_SID_LIBSD = 0x80000701u;
     constexpr uint32_t IOP_SID_FATAL_FRAME_SDRDRV = 0x19740512u;
@@ -167,6 +169,9 @@ namespace
     constexpr uint32_t K_DTX_SCHEDULER_RESUME = 0x00102010u;
     constexpr uint32_t K_LOTR_SOUND_SCHEDULER_CALL = 0x00102020u;
     constexpr uint32_t K_LOTR_SOUND_SCHEDULER_RESUME = 0x00102030u;
+    constexpr uint32_t K_HG_SNDDRV_SCHEDULER_CALL = 0x00102040u;
+    constexpr uint32_t K_HG_SNDDRV_SCHEDULER_RESUME = 0x00102050u;
+    constexpr uint32_t K_HG_SNDDRV_SCHEDULER_WAIT = 0x00102060u;
     uint32_t g_schedulerRpcClient = 0u;
     uint32_t g_schedulerRpcNumber = 0u;
     uint32_t g_schedulerRpcSend = 0u;
@@ -178,6 +183,18 @@ namespace
     uint32_t g_schedulerLotrSoundEndFunction = 0u;
     uint32_t g_schedulerLotrSoundSemaphore = 0u;
     uint32_t g_schedulerLotrSoundResult = 0u;
+    std::atomic<uint32_t> g_hgSnddrvCallbackHits{0u};
+    uint32_t g_hgSnddrvOrder = 0u;
+    uint32_t g_hgSnddrvResumeOrder = 0u;
+    uint32_t g_hgSnddrvCallbackOrder = 0u;
+    uint32_t g_hgSnddrvBusyAtResume = 0u;
+    uint32_t g_hgSnddrvBusyAfterCallback = 0u;
+    uint32_t g_hgSnddrvResponseAtCallback = 0xFFFFFFFFu;
+    uint32_t g_hgSnddrvClient = 0u;
+    uint32_t g_hgSnddrvSend = 0u;
+    uint32_t g_hgSnddrvReceive = 0u;
+    uint32_t g_hgSnddrvEndFunction = 0u;
+    uint32_t g_hgSnddrvResult = 0xFFFFFFFFu;
 
     void writeGuestU32(uint8_t *rdram, uint32_t addr, uint32_t value);
 
@@ -215,6 +232,54 @@ namespace
     void schedulerLotrSoundRpcResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
     {
         g_schedulerLotrSoundResult = ::getRegU32(ctx, 2);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void hgSnddrvEndCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        g_hgSnddrvCallbackOrder = ++g_hgSnddrvOrder;
+        g_hgSnddrvResponseAtCallback =
+            *reinterpret_cast<const uint32_t *>(rdram + g_hgSnddrvReceive);
+        ++g_hgSnddrvCallbackHits;
+        ctx->pc = ::getRegU32(ctx, 31);
+    }
+
+    void schedulerHgSnddrvRpcCall(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        SET_GPR_U32(ctx, 4, g_hgSnddrvClient);
+        SET_GPR_U32(ctx, 5, 0x00120000u);
+        SET_GPR_U32(ctx, 6, K_SIF_RPC_MODE_NOWAIT);
+        SET_GPR_U32(ctx, 7, g_hgSnddrvSend);
+        SET_GPR_U32(ctx, 8, 32u);
+        SET_GPR_U32(ctx, 9, g_hgSnddrvReceive);
+        SET_GPR_U32(ctx, 10, sizeof(uint32_t));
+        SET_GPR_U32(ctx, 11, g_hgSnddrvEndFunction);
+        writeGuestU32(rdram, ::getRegU32(ctx, 29), 0x00001000u);
+        ctx->pc = K_HG_SNDDRV_SCHEDULER_RESUME;
+        SifCallRpc(rdram, ctx, runtime);
+    }
+
+    void schedulerHgSnddrvRpcResume(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_hgSnddrvResumeOrder = ++g_hgSnddrvOrder;
+        g_hgSnddrvResult = ::getRegU32(ctx, 2);
+        SET_GPR_U32(ctx, 4, g_hgSnddrvClient);
+        SifCheckStatRpc(rdram, ctx, runtime);
+        g_hgSnddrvBusyAtResume = ::getRegU32(ctx, 2);
+        ctx->pc = K_HG_SNDDRV_SCHEDULER_WAIT;
+    }
+
+    void schedulerHgSnddrvRpcWait(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (g_hgSnddrvCallbackHits.load() == 0u)
+        {
+            ctx->pc = K_HG_SNDDRV_SCHEDULER_WAIT;
+            return;
+        }
+        SET_GPR_U32(ctx, 4, g_hgSnddrvClient);
+        SifCheckStatRpc(rdram, ctx, runtime);
+        g_hgSnddrvBusyAfterCallback = ::getRegU32(ctx, 2);
         ctx->pc = 0u;
         runtime->requestStop();
     }
@@ -558,6 +623,29 @@ void register_ps2_sif_rpc_tests()
             }
         });
 
+        tc.Run("DBCMAN unsupported RPC returns an empty bounded payload", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kDbcManSid = 0x80001300u;
+            constexpr uint32_t kGenericRpc = 0x8000131Au;
+            constexpr uint32_t kRecvAddr = 0x00035A40u;
+            constexpr uint32_t kPackedRequestLength = 0x0103C002u;
+
+            std::memset(env.rdram.data() + kRecvAddr, 0xA5, 0x90u);
+            writeGuestStruct(env.rdram.data(), kRecvAddr + 8u, kPackedRequestLength);
+            const ps2x::iop::RpcResult result =
+                callIop(env, kDbcManSid, kGenericRpc,
+                        kRecvAddr, 0x90u, kRecvAddr, 0x90u);
+
+            t.IsTrue(result.handled, "DBCMAN generic RPC should be handled by the compatibility service");
+            t.Equals(result.resultAddress, kRecvAddr, "DBCMAN generic RPC should return the receive buffer");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 8u), 0u,
+                     "unsupported DBCMAN commands must not echo a packed request as payload length");
+            t.Equals(env.rdram[kRecvAddr + 12u], static_cast<uint8_t>(0xA5),
+                     "empty DBCMAN response should not fabricate payload bytes");
+        });
+
         tc.Run("LIBSD RPC routes through the IOP audio service", [](TestCase &t)
         {
             TestEnv env;
@@ -750,6 +838,90 @@ void register_ps2_sif_rpc_tests()
 
             t.Equals(env.runtime.eeScheduler().pollSemaphore(semaId), semaId,
                      "LotR sound callback completion should signal the sema");
+        });
+
+        tc.Run("Haunting Ground SNDDRV NOWAIT response precedes its delayed guest callback", [](TestCase &t)
+        {
+            TestEnv env;
+            std::string error;
+            t.IsTrue(PS2IopTransport::configureForTesting(
+                         &env.runtime,
+                         {"SLUS_210.75", 0x00100008u, 0xA295AF2Bu},
+                         &error),
+                     "the exact Haunting Ground ELF identity should configure");
+
+            constexpr uint32_t kClientAddr = 0x00039000u;
+            constexpr uint32_t kSendAddr = 0x0003A000u;
+            constexpr uint32_t kRecvAddr = 0x0003A100u;
+            constexpr uint32_t kEndFunc = 0x001FFD80u;
+            constexpr uint32_t kSpu2Destination = 0x000DAAC0u;
+            const std::array<uint8_t, 16> payload = {
+                0x01u, 0x12u, 0x23u, 0x34u, 0x45u, 0x56u, 0x67u, 0x78u,
+                0x89u, 0x9Au, 0xABu, 0xBCu, 0xCDu, 0xDEu, 0xEFu, 0xF0u,
+            };
+
+            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            setRegU32(env.ctx, 4, static_cast<uint32_t>(payload.size()));
+            ps2_stubs::sceSifAllocIopHeap(env.rdram.data(), &env.ctx, &env.runtime);
+            const uint32_t iopSourceAddr = ::getRegU32(&env.ctx, 2);
+            t.IsTrue(iopSourceAddr != 0u,
+                     "the test should allocate a real synthetic IOP staging range");
+
+            std::memset(env.rdram.data() + kSendAddr, 0, 32u);
+            writeGuestU32(env.rdram.data(), kSendAddr + 8u, iopSourceAddr);
+            writeGuestU32(env.rdram.data(), kSendAddr + 12u, kSpu2Destination);
+            writeGuestU32(env.rdram.data(), kSendAddr + 16u,
+                          static_cast<uint32_t>(payload.size()));
+            writeGuestU32(env.rdram.data(), kSendAddr + 20u, 1u);
+            writeGuestU32(env.rdram.data(), kRecvAddr, 0xFFFFFFFFu);
+            t.IsTrue(ps2_stubs::writeSifIopHeap(
+                         iopSourceAddr, payload.data(), payload.size()),
+                     "the observed SNDDRV source should fit in synthetic IOP staging RAM");
+
+            setRegU32(env.ctx, 4, kClientAddr);
+            setRegU32(env.ctx, 5, IOP_SID_HG_SNDDRV_TRANSFER);
+            setRegU32(env.ctx, 6, 0u);
+            SifBindRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), KE_OK,
+                     "SifBindRpc should bind the game-scoped SNDDRV transfer service");
+
+            env.runtime.registerFunction(kEndFunc, hgSnddrvEndCallback);
+            env.runtime.registerFunction(K_HG_SNDDRV_SCHEDULER_CALL, schedulerHgSnddrvRpcCall);
+            env.runtime.registerFunction(K_HG_SNDDRV_SCHEDULER_RESUME, schedulerHgSnddrvRpcResume);
+            env.runtime.registerFunction(K_HG_SNDDRV_SCHEDULER_WAIT, schedulerHgSnddrvRpcWait);
+            g_hgSnddrvCallbackHits = 0u;
+            g_hgSnddrvOrder = 0u;
+            g_hgSnddrvResumeOrder = 0u;
+            g_hgSnddrvCallbackOrder = 0u;
+            g_hgSnddrvBusyAtResume = 0u;
+            g_hgSnddrvBusyAfterCallback = 1u;
+            g_hgSnddrvResponseAtCallback = 0xFFFFFFFFu;
+            g_hgSnddrvClient = kClientAddr;
+            g_hgSnddrvSend = kSendAddr;
+            g_hgSnddrvReceive = kRecvAddr;
+            g_hgSnddrvEndFunction = kEndFunc;
+            g_hgSnddrvResult = 0xFFFFFFFFu;
+
+            R5900Context mainContext{};
+            mainContext.pc = K_HG_SNDDRV_SCHEDULER_CALL;
+            setRegU32(mainContext, 29, K_STACK_ADDR);
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.Equals(g_hgSnddrvResult, static_cast<uint32_t>(KE_OK),
+                     "the NOWAIT caller should resume immediately with success");
+            t.Equals(g_hgSnddrvResumeOrder, 1u,
+                     "the caller continuation should run before transfer completion");
+            t.Equals(g_hgSnddrvCallbackOrder, 2u,
+                     "the delayed guest callback should run after the caller continuation");
+            t.Equals(g_hgSnddrvCallbackHits.load(), 1u,
+                     "the delayed transfer callback should run exactly once");
+            t.Equals(g_hgSnddrvBusyAtResume, 1u,
+                     "the client must remain busy while deferred completion is pending");
+            t.Equals(g_hgSnddrvResponseAtCallback, 0u,
+                     "the response buffer must be ready before the guest callback runs");
+            t.Equals(g_hgSnddrvBusyAfterCallback, 0u,
+                     "callback completion should clear the client busy state");
         });
 
         tc.Run("RECVX sound callbacks complete in HLE and only clear busy on designated callbacks", [](TestCase &t)

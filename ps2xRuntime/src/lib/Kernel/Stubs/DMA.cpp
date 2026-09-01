@@ -167,7 +167,51 @@ namespace ps2_stubs
 
     void sceDmaRecvN(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDmaRecvN", rdram, ctx, runtime);
+        if (!runtime)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        const uint32_t channelBase = resolveDmaChannelBase(rdram, getRegU32(ctx, 4));
+        const uint32_t destination = getRegU32(ctx, 5);
+        const uint32_t qwc = normalizeQwcFromArg(getRegU32(ctx, 6));
+        if (channelBase != 0x1000D000u || qwc > (PS2_SCRATCHPAD_SIZE / 16u))
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        const uint64_t byteCount64 = static_cast<uint64_t>(qwc) * 16u;
+        const uint32_t byteCount = static_cast<uint32_t>(byteCount64);
+        uint8_t *dst = getMemPtr(rdram, destination);
+        uint8_t *scratchpad = runtime->memory().getScratchpad();
+        uint32_t destinationOffset = 0u;
+        bool destinationScratch = false;
+        if (!dst || !scratchpad ||
+            !ps2ResolveGuestPointer(destination, destinationOffset, destinationScratch) ||
+            destinationScratch || destinationOffset + byteCount > PS2_RAM_SIZE)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        PS2Memory &mem = runtime->memory();
+        const uint32_t sourceOffset = mem.readIORegister(channelBase + 0x80u) & (PS2_SCRATCHPAD_SIZE - 1u);
+        ps2TraceGuestRangeWrite(rdram, destination, byteCount, "sceDmaRecvN", ctx);
+        for (uint32_t index = 0u; index < byteCount; ++index)
+        {
+            dst[index] = scratchpad[(sourceOffset + index) & (PS2_SCRATCHPAD_SIZE - 1u)];
+        }
+
+        mem.writeIORegister(channelBase + 0x10u, toDmaPhys(destination));
+        mem.writeIORegister(channelBase + 0x20u, qwc);
+        mem.writeIORegister(channelBase + 0x00u, 0x100u);
+        mem.writeIORegister(channelBase + 0x10u, toDmaPhys(destination + byteCount));
+        mem.writeIORegister(channelBase + 0x20u, 0u);
+        mem.writeIORegister(channelBase + 0x80u, (sourceOffset + byteCount) & (PS2_SCRATCHPAD_SIZE - 1u));
+        mem.writeIORegister(channelBase + 0x00u, 0u);
+        setReturnS32(ctx, 0);
     }
 
     void sceDmaReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

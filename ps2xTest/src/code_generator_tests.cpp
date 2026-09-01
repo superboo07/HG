@@ -258,6 +258,31 @@ void register_code_generator_tests()
                  "constant MMIO SW should not go through WRITE32 address classification");
     });
 
+    tc.Run("exact local MMIO address overrides conservative analyzer annotation", [](TestCase &t) {
+        Function func;
+        func.name = "ipu_dma_register_save";
+        func.start = 0x1100;
+        func.end = 0x1110;
+        func.isRecompiled = true;
+
+        std::vector<Instruction> instructions;
+        instructions.push_back(makeLui(0x1100, 1, 0x1000));
+        instructions.push_back(makeOri(0x1104, 1, 1, 0xB400));
+        Instruction load = makeLw(0x1108, 2, 1, 0);
+        load.isMmio = true;
+        load.mmioAddress = 0x10000000u;
+        instructions.push_back(load);
+
+        CodeGenerator gen({}, {});
+        const std::string generated = gen.generateFunction(func, instructions, false);
+        printGeneratedCode("exact local MMIO address overrides conservative analyzer annotation", generated);
+
+        t.IsTrue(generated.find("runtime->Load32(rdram, ctx, 0x1000B400u)") != std::string::npos,
+                 "LUI/ORI proof should preserve the exact IPU DMA register address");
+        t.IsTrue(generated.find("runtime->Load32(rdram, ctx, 0x10000000u)") == std::string::npos,
+                 "conservative analyzer annotation must not replace an exact local address");
+    });
+
     tc.Run("constant RDRAM load and store emit fast memory access", [](TestCase &t) {
         Function func;
         func.name = "rdram_access";
@@ -890,6 +915,36 @@ void register_code_generator_tests()
             t.IsTrue(ctc1Code.find("ctx->fcr31 = GPR_U32(ctx, 4) & 0x0183FFFF") != std::string::npos,
                      "CTC1 FCR31 should mask and write fcr31");
             t.IsTrue(ctc1Code.find("ignored") == std::string::npos, "CTC1 FCR31 should not be ignored");
+        });
+
+        tc.Run("R5900 SQRT.S and RSQRT.S use the encoded ft operand", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            Instruction sqrt{};
+            sqrt.opcode = OPCODE_COP1;
+            sqrt.rs = COP1_S;
+            sqrt.rt = 6;  // ft
+            sqrt.rd = 9;  // fs is unused by SQRT.S
+            sqrt.sa = 2;  // fd
+            sqrt.function = COP1_S_SQRT;
+
+            const std::string sqrtCode = gen.translateInstruction(sqrt);
+            t.IsTrue(sqrtCode.find("ctx->f[2] = FPU_SQRT_S(ctx->f[6]);") != std::string::npos,
+                     "SQRT.S must source ft on the R5900");
+            t.IsTrue(sqrtCode.find("ctx->f[9]") == std::string::npos,
+                     "SQRT.S must not source the unused fs field");
+
+            Instruction rsqrt{};
+            rsqrt.opcode = OPCODE_COP1;
+            rsqrt.rs = COP1_S;
+            rsqrt.rt = 7;  // ft, radicand
+            rsqrt.rd = 5;  // fs, numerator
+            rsqrt.sa = 3;  // fd
+            rsqrt.function = COP1_S_RSQRT;
+
+            const std::string rsqrtCode = gen.translateInstruction(rsqrt);
+            t.IsTrue(rsqrtCode.find("ctx->f[3] = ctx->f[5] / sqrtf(ctx->f[7]);") != std::string::npos,
+                     "RSQRT.S must divide fs by sqrt(ft) on the R5900");
         });
 
         tc.Run("VU CFC2/CTC2 access VI registers directly", [](TestCase& t)

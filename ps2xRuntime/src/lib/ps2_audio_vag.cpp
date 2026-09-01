@@ -1,4 +1,5 @@
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_audio_adpcm.h"
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -58,10 +59,31 @@ namespace ps2_vag
         outPcm.clear();
         outPcm.reserve(numBlocks * 28);
 
-        int16_t s1 = 0, s2 = 0;
-        const uint8_t *block = data + 48;
+        Ps2AdpcmDecoderState state{};
+        const uint32_t availableBytes = sizeBytes - 48u;
+        const uint32_t requestedBytes = numBlocks * 16u;
+        return ps2_adpcm::decodeBlocks(data + 48u,
+                                       std::min(availableBytes, requestedBytes),
+                                       state,
+                                       outPcm);
+    }
+}
 
-        for (uint32_t b = 0; b < numBlocks && (block + 16) <= data + sizeBytes; ++b, block += 16)
+namespace ps2_adpcm
+{
+    bool decodeBlocks(const uint8_t *data,
+                      size_t sizeBytes,
+                      Ps2AdpcmDecoderState &state,
+                      std::vector<int16_t> &outPcm)
+    {
+        if ((!data && sizeBytes != 0u) || (sizeBytes & 0xFu) != 0u)
+            return false;
+
+        outPcm.clear();
+        outPcm.reserve((sizeBytes / 16u) * 28u);
+        const uint8_t *block = data;
+
+        for (size_t offset = 0u; offset < sizeBytes; offset += 16u, block += 16u)
         {
             uint8_t shift = block[0] & 0x0F;
             if (shift > 12)
@@ -78,8 +100,8 @@ namespace ps2_vag
                 const int32_t shiftedSample = rawSample << (12 - shift);
 
                 int32_t filteredSample;
-                const int32_t old = s1;
-                const int32_t older = s2;
+                const int32_t old = state.previous;
+                const int32_t older = state.previousPrevious;
                 switch (filter)
                 {
                 case 0:
@@ -103,8 +125,8 @@ namespace ps2_vag
                 }
 
                 const int16_t clamped = clamp16(filteredSample);
-                s2 = s1;
-                s1 = clamped;
+                state.previousPrevious = state.previous;
+                state.previous = clamped;
                 outPcm.push_back(clamped);
             }
         }

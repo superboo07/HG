@@ -645,6 +645,54 @@ void register_ps2_runtime_kernel_tests()
                       "the scheduler must publish guest execution only around the active guest call");
         });
 
+        tc.Run("CreateThread accepts the reserved EE idle priority zero", [](TestCase &t)
+        {
+            TestEnv env;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+
+            const int id = ee.createThread(EeThreadCreateParams{
+                0u, K_SCHED_A, 0x20000u, 0x800u, 0u, 0, 0u});
+            t.IsTrue(id > EeScheduler::kMainThreadId,
+                     "libkernel InitThread must be able to create its priority-zero idle thread");
+            const GuestThread *idle = ee.thread(id);
+            t.IsTrue(idle != nullptr && idle->initialPriority == 0 && idle->currentPriority == 0,
+                     "the reserved idle priority must be retained exactly");
+        });
+
+        tc.Run("ChangeThreadPriority returns the previous priority", [](TestCase &t)
+        {
+            TestEnv env;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+
+            const int id = ee.createThread(EeThreadCreateParams{
+                0u, K_SCHED_A, 0x20000u, 0x800u, 0u, 1, 0u});
+            setRegU32(env.ctx, 4, static_cast<uint32_t>(id));
+            setRegU32(env.ctx, 5, 18u);
+            ChangeThreadPriority(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), 1,
+                     "a successful priority change must return the old priority, not KE_OK");
+            t.Equals(ee.thread(id)->currentPriority, 18,
+                     "the normal syscall should apply the requested priority");
+
+            setRegU32(env.ctx, 4, static_cast<uint32_t>(id));
+            setRegU32(env.ctx, 5, 1u);
+            iChangeThreadPriority(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), 18,
+                     "the interrupt-safe syscall must return the same old-priority result");
+            t.Equals(ee.thread(id)->currentPriority, 1,
+                     "the old return value must be usable to restore the priority");
+
+            setRegU32(env.ctx, 4, static_cast<uint32_t>(id));
+            setRegU32(env.ctx, 5, 0u);
+            ChangeThreadPriority(env.rdram.data(), &env.ctx, &env.runtime);
+            t.IsTrue(getRegS32(env.ctx, 2) < 0,
+                     "an invalid priority must still return the kernel error code");
+            t.Equals(ee.thread(id)->currentPriority, 1,
+                     "a failed priority change must preserve the current priority");
+        });
+
         tc.Run("thread lifecycle, nested suspend, WAIT-SUSPEND, and wakeup count are centralized", [](TestCase &t)
         {
             TestEnv env;

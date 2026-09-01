@@ -1,6 +1,7 @@
 #ifndef PS2_GIF_ARBITER_H
 #define PS2_GIF_ARBITER_H
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -38,8 +39,11 @@ public:
 private:
     ProcessPacketFn m_processFn;
     std::vector<GifArbiterPacket> m_queue;
+    std::array<std::vector<uint8_t>, 3> m_pathCarry{};
+    std::array<bool, 3> m_pathCarryDirectHl{};
 
     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
+    static uint32_t completePacketPrefixBytes(const uint8_t *data, uint32_t sizeBytes);
     static uint8_t pathPriority(GifPathId id);
 };
 

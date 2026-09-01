@@ -112,7 +112,7 @@ namespace ps2_syscalls
             const int priority = static_cast<int>(getRegU32(ctx, 5));
             int oldPriority = 0;
             const int result = ee.changePriority(id, priority, interruptSafe, oldPriority);
-            setReturnS32(ctx, result);
+            setReturnS32(ctx, result == KE_OK ? oldPriority : result);
             ee.transferIfRequested(interruptSafe);
         }
 
@@ -230,7 +230,13 @@ namespace ps2_syscalls
             param->initial_priority,
             param->option,
         };
-        setReturnS32(ctx, scheduler(rdram, ctx, runtime).createThread(decoded));
+        const int result = scheduler(rdram, ctx, runtime).createThread(decoded);
+        RUNTIME_LOG("[ee:thread-create] id=" << std::dec << result
+                    << " entry=0x" << std::hex << decoded.entry
+                    << " stack=0x" << decoded.stack
+                    << " stackSize=0x" << decoded.stackSize
+                    << " priority=" << std::dec << decoded.priority);
+        setReturnS32(ctx, result);
     }
 
     void DeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -268,6 +274,8 @@ namespace ps2_syscalls
         }
         if (!runtime->hasFunction(target->entry))
         {
+            RUNTIME_LOG("[ee:thread-start:reject] id=" << std::dec << id
+                        << " entry=0x" << std::hex << target->entry);
             setReturnS32(ctx, KE_ERROR);
             return;
         }
@@ -282,6 +290,10 @@ namespace ps2_syscalls
             target->ownsStack = true;
         }
         const int result = ee.startThread(id, arg, *ctx, false);
+        RUNTIME_LOG("[ee:thread-start] id=" << std::dec << id
+                    << " result=" << result
+                    << " entry=0x" << std::hex << target->entry
+                    << " arg=0x" << arg);
         setReturnS32(ctx, result);
         ee.transferIfRequested(false);
     }

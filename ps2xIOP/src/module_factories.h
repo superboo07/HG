@@ -2,6 +2,7 @@
 
 #include "iop_service.h"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -98,6 +99,29 @@ namespace ps2x::iop::detail
         ClFileRpcLayout rpc;
     };
 
+    struct CdSearchFileRecord
+    {
+        std::string guestPath;
+        uint32_t lsn = 0u;
+        uint32_t size = 0u;
+        std::array<uint8_t, 8> date{};
+    };
+
+    struct CdSearchFileBindings
+    {
+        std::string serviceName;
+        uint32_t sid = 0u;
+        uint32_t function = 0u;
+        uint32_t pathOffset = 0x24u;
+        uint32_t pathBytes = 0x100u;
+        uint32_t resultBytes = 0x24u;
+        uint32_t receiveResultOffset = 0u;
+        uint32_t successValue = 1u;
+        uint32_t failureValue = 0u;
+        bool validateHostFileSize = true;
+        std::vector<CdSearchFileRecord> files;
+    };
+
     // TODO This is for the lord of the rings better name for that one
     struct SoundUpdateStubBindings
     {
@@ -109,6 +133,27 @@ namespace ps2x::iop::detail
         bool signalNowaitCompletion = false;
         bool completeQueuedPlayStreams = false;
         std::vector<uint32_t> suppressedCompletionCallbacks;
+    };
+
+    struct CapcomSnddrvTransferBindings
+    {
+        std::string serviceName;
+        uint32_t sid = 0u;
+        uint32_t functionClass = 0x00120000u;
+        uint32_t maximumTransferBytes = 0x4000u;
+        int32_t channel = 0;
+        uint32_t iopClockHz = 36'864'000u;
+        uint32_t dmaCyclesPer16BitWord = 4u;
+        uint32_t pollDelayMicroseconds = 100u;
+        uint32_t blockingDelayMicroseconds = 1u;
+        uint32_t mailboxBytes = 0u;
+        uint32_t mailboxSequenceOffset = 0u;
+        uint32_t mailboxCommandIopDestination = 0u;
+        uint32_t mailboxResponseIopDestination = 0u;
+        std::array<std::array<uint32_t, 2>, 2> playbackDescriptorHandles{};
+        std::array<std::array<uint32_t, 2>, 2> playbackCallbackObjects{};
+        uint32_t playbackRingBytes = 0u;
+        std::vector<uint32_t> mailboxIopDestinations;
     };
 
     struct SdrdrvBindings
@@ -152,6 +197,8 @@ namespace ps2x::iop::detail
     std::unique_ptr<IopService> createTsnddrvService(IopHost &host, TsnddrvBindings bindings);
     std::unique_ptr<IopService> createCriDtxService(IopHost &host, CriDtxBindings bindings);
     std::unique_ptr<IopService> createClFileService(IopHost &host, ClFileBindings bindings);
+    std::unique_ptr<IopService> createCdSearchFileService(IopHost &host, CdSearchFileBindings bindings);
     std::unique_ptr<IopService> createSoundUpdateStubService(IopHost &host, SoundUpdateStubBindings bindings);
+    std::unique_ptr<IopService> createCapcomSnddrvTransferService(IopHost &host, CapcomSnddrvTransferBindings bindings);
     std::unique_ptr<IopService> createSdrdrvService(IopHost &host, SdrdrvBindings bindings);
 }

@@ -37,6 +37,19 @@ namespace ps2_stubs
     void scePadSetVrefParam(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void scePadSetWarningLevel(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void scePadStateIntToStr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void scePad2Init(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void scePad2End(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void scePad2CreateSocket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void scePad2DeleteSocket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void scePad2Read(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void scePad2GetButtonProfile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void scePad2GetState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void scePad2GetButtonInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void scePad2InitDmaDBuff(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void scePad2LinkDriver(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void scePad2GetSide(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void scePad2CheckDma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void scePad2SetButtonOrder(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 
     static constexpr size_t kPadDebugPortCount = 2u;
     static constexpr size_t kPadDebugSlotCount = 1u;
@@ -76,6 +89,8 @@ namespace ps2_stubs
     };
 
     PadDebugSnapshot getPadDebugSnapshot();
+    void refreshPad2DmaBuffers(uint8_t *rdram);
+    void preparePad2DmaRead(uint8_t *rdram, uint32_t address, uint32_t size, uint32_t pc);
     void setPadOverrideState(uint16_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry);
     void clearPadOverrideState();
 }

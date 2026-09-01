@@ -34,6 +34,8 @@ public:
 
 private:
     void ResetUnlocked();
+    bool CanBatchTriangle(const GSPrimitiveBatch &batch) const;
+    void FlushTriangleQueueUnlocked();
     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
 
@@ -72,4 +74,5 @@ private:
     GSTransferSnapshot m_transferState{};
     std::vector<uint8_t> m_localToHostBuffer;
     size_t m_localToHostReadPos = 0;
+    std::vector<GSPrimitiveBatch> m_triangleQueue;
 };

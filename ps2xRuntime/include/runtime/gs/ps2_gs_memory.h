@@ -539,10 +539,20 @@ namespace GSMem
 	void InitLookupTables();
 
 	void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
+	u32 AddressCT32(u32 bp, u32 bw, u32 x, u32 y);
+	void FillRectCT32(u8* data, u32 bp, u32 bw,
+	                  u32 x0, u32 y0, u32 x1, u32 y1, u32 value);
 	void WriteZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
+	u32 AddressZ32(u32 bp, u32 bw, u32 x, u32 y);
+	void FillRectZ32(u8* data, u32 bp, u32 bw,
+	                 u32 x0, u32 y0, u32 x1, u32 y1, u32 value);
 
 	void WriteCT24(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
+	void FillRectCT24(u8* data, u32 bp, u32 bw,
+	                  u32 x0, u32 y0, u32 x1, u32 y1, u32 value);
 	void WriteZ24(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
+	void FillRectZ24(u8* data, u32 bp, u32 bw,
+	                 u32 x0, u32 y0, u32 x1, u32 y1, u32 value);
 
 	void WriteCT16(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 	void WriteCT16S(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);

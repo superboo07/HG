@@ -2,11 +2,13 @@
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
 
+#include <chrono>
+
 namespace ps2_syscalls
 {
     namespace
     {
-        SifRpcDebugEvent makeRpcDebugEvent(const char *op, R5900Context *ctx, PS2Runtime *runtime)
+        SifRpcDebugEvent makeRpcDebugEvent(const char *op, const R5900Context *ctx, PS2Runtime *runtime)
         {
             SifRpcDebugEvent event{};
             event.op = op;
@@ -335,6 +337,18 @@ namespace ps2_syscalls
     {
         std::lock_guard<std::recursive_mutex> rpcCallLock(g_sif_call_rpc_mutex);
 
+        static uint32_t callLogCount = 0;
+        if (callLogCount < 128u)
+        {
+            RUNTIME_LOG("[SifCallRpc:CALL] pc=0x" << std::hex << ctx->pc
+                                                   << " ra=0x" << getRegU32(ctx, 31)
+                                                   << " client=0x" << getRegU32(ctx, 4)
+                                                   << " rpc=0x" << getRegU32(ctx, 5)
+                                                   << " mode=0x" << getRegU32(ctx, 6)
+                                                   << std::dec << std::endl);
+            ++callLogCount;
+        }
+
         const uint32_t clientPtr = getRegU32(ctx, 4);
         const uint32_t rpcNum = getRegU32(ctx, 5);
         const uint32_t mode = getRegU32(ctx, 6);
@@ -537,12 +551,13 @@ namespace ps2_syscalls
 
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
 
-            if (iopResult.signalNowaitCompletion &&
+            if (iopResult.completionDelayMicroseconds == 0u &&
+                iopResult.signalNowaitCompletion &&
                 (mode & kSifRpcModeNowait) != 0u)
             {
                 (void)signalRpcCompletionSema(runtime, completionSemaphore);
             }
-            if (iopResult.signalCompletion)
+            if (iopResult.completionDelayMicroseconds == 0u && iopResult.signalCompletion)
             {
                 (void)signalRpcCompletionSema(runtime, completionSemaphore);
             }
@@ -672,6 +687,90 @@ namespace ps2_syscalls
             };
             runtime->eeScheduler().invokeCurrent(std::move(callback));
         };
+
+        if (iopResult.handled && !serverDispatched &&
+            iopResult.completionDelayMicroseconds != 0u)
+        {
+            const uint32_t resultPointer = iopResult.resultAddress;
+            if (receiveBuffer != 0u && receiveSize != 0u &&
+                resultPointer != 0u && resultPointer != receiveBuffer)
+            {
+                rpcCopyToRdram(rdram, receiveBuffer, resultPointer, receiveSize);
+            }
+
+            setReturnS32(ctx, 0);
+            const R5900Context callbackContext = *ctx;
+            const auto recordCompletion = [=](const R5900Context &base, bool callbackCompleted)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(g_rpc_mutex);
+                    g_rpc_clients[clientPtr].busy = false;
+                }
+                SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", &base, runtime);
+                event.clientPtr = clientPtr;
+                event.serverPtr = serverPtr;
+                event.sid = sid;
+                event.rpcNum = rpcNum;
+                event.mode = mode;
+                event.sendBuf = sendBuf;
+                event.sendSize = sendSize;
+                event.recvBuf = receiveBuffer;
+                event.recvSize = receiveSize;
+                event.resultPtr = resultPointer;
+                event.endFunc = endFunction;
+                event.endParam = endParameter;
+                event.semaId = completionSemaphore;
+                event.flags =
+                    ((mode & kSifRpcModeNowait) ? kSifRpcDebugFlagNowait : 0u) |
+                    kSifRpcDebugFlagHandledByHle |
+                    (callbackCompleted ? kSifRpcDebugFlagCallback : 0u);
+                fillRpcDebugPreview(rdram, sendBuf, sendSize,
+                                    event.sendPreview, event.sendPreviewSize);
+                fillRpcDebugPreview(rdram, receiveBuffer, receiveSize,
+                                    event.recvPreview, event.recvPreviewSize);
+                event.result = 0;
+                pushSifRpcDebugEvent(event);
+            };
+
+            runtime->eeScheduler().scheduleHostCallback(
+                std::chrono::microseconds(iopResult.completionDelayMicroseconds),
+                [=]() mutable
+                {
+                    if (endFunction == 0u ||
+                        iopResult.callbackPolicy == ps2x::iop::CallbackPolicy::Suppress)
+                    {
+                        recordCompletion(callbackContext, false);
+                        return;
+                    }
+
+                    uint32_t callbackFunction = endFunction;
+                    if (!runtime->hasFunction(callbackFunction) && callbackFunction >= 0x10000u &&
+                        runtime->hasFunction(callbackFunction - 0x10000u))
+                    {
+                        callbackFunction -= 0x10000u;
+                    }
+                    if (!runtime->hasFunction(callbackFunction))
+                    {
+                        (void)signalRpcCompletionSema(runtime, completionSemaphore);
+                        recordCompletion(callbackContext, false);
+                        return;
+                    }
+
+                    GuestInvocation callback{};
+                    callback.kind = GuestInvocationKind::RpcCallback;
+                    callback.context = callbackContext;
+                    callback.context.pc = callbackFunction;
+                    SET_GPR_U32(&callback.context, 4, endParameter);
+                    SET_GPR_U32(&callback.context, 29, 0u);
+                    SET_GPR_U32(&callback.context, 31, 0u);
+                    callback.onComplete = [recordCompletion](const R5900Context &, R5900Context &base)
+                    {
+                        recordCompletion(base, true);
+                    };
+                    runtime->eeScheduler().queueInvocation(std::move(callback));
+                });
+            return;
+        }
 
         if (serverDispatched)
         {

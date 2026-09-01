@@ -97,6 +97,21 @@ void register_ps2_vu_tests()
                      "MulVector should multiply lanes component-wise");
         });
 
+        tc.Run("Normalize_uses_xyz_and_clears_w_in_place", [](TestCase &t)
+        {
+            VuEnv env;
+            writeVec4(env, kA, 0.0f, 0.2f, 1.0f, 1.0f);
+            SET_GPR_U32(&env.ctx, 4, kA);
+            SET_GPR_U32(&env.ctx, 5, kA);
+            ps2_stubs::sceVu0Normalize(env.rdram.data(), &env.ctx, &env.runtime);
+            float out[4]{};
+            readVec4f(env, kA, out);
+            t.IsTrue(nearlyEqual(out[0], 0.0f) && nearlyEqual(out[1], 0.19611613f) &&
+                         nearlyEqual(out[2], 0.98058069f) && nearlyEqual(out[3], 0.0f),
+                     "Normalize should ignore input w, normalize xyz, and clear output w");
+            t.Equals(getRegU32(&env.ctx, 2), 0u, "Normalize should report success");
+        });
+
         tc.Run("ScaleVectorXYZ_scales_xyz", [](TestCase &t)
         {
             VuEnv env;
@@ -296,7 +311,7 @@ void register_ps2_vu_tests()
             t.IsTrue(allMatch, "MulMatrix(dst, I, A) should equal A");
         });
 
-        tc.Run("MulMatrix_equals_arg1_times_arg2", [](TestCase &t)
+        tc.Run("MulMatrix_equals_arg2_times_arg1", [](TestCase &t)
         {
             VuEnv env;
             float m0[16] = {
@@ -317,9 +332,9 @@ void register_ps2_vu_tests()
                     float sum = 0.0f;
                     for (int k = 0; k < 4; ++k)
                     {
-                        // expected = mulVuMatrix(m0, m1) = m0 * m1 (arg1 * arg2);
+                        // expected = mulVuMatrix(m1, m0) = m1 * m0 (arg2 * arg1);
                         // mulVuMatrix is file-local to VU.cpp, so mirror its formula here.
-                        sum += m1[4 * k + j] * m0[4 * i + k];
+                        sum += m0[4 * k + j] * m1[4 * i + k];
                     }
                     expected[4 * i + j] = sum;
                 }
@@ -340,7 +355,7 @@ void register_ps2_vu_tests()
                     allMatch = false;
                 }
             }
-            t.IsTrue(allMatch, "MulMatrix(dst, m0, m1) should equal m0*m1 (mulVuMatrix(m0,m1), arg1*arg2)");
+            t.IsTrue(allMatch, "MulMatrix(dst, m0, m1) should equal m1*m0 (mulVuMatrix(m1,m0), arg2*arg1)");
         });
 
         tc.Run("RotMatrix_Z_matches_RotMatrixZ", [](TestCase &t)

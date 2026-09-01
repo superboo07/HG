@@ -4,15 +4,50 @@
 #include "runtime/ps2_memory.h"
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#include <unordered_map>
 
 namespace
 {
     static constexpr uint32_t kHostFrameWidth = 640u;
+
+    struct DeferredPresentationState
+    {
+        std::mutex mutex;
+        std::vector<uint8_t> vram;
+        GSPresentationRequest request{};
+        uint64_t generation = 0u;
+        uint64_t consumedGeneration = 0u;
+    };
+
+    std::mutex g_deferredPresentationStatesMutex;
+    std::unordered_map<const GS *, std::shared_ptr<DeferredPresentationState>>
+        g_deferredPresentationStates;
+
+    std::shared_ptr<DeferredPresentationState> getDeferredPresentationState(const GS *gs)
+    {
+        std::lock_guard<std::mutex> lock(g_deferredPresentationStatesMutex);
+        auto &state = g_deferredPresentationStates[gs];
+        if (!state)
+            state = std::make_shared<DeferredPresentationState>();
+        return state;
+    }
+
+    void resetDeferredPresentationState(const GS *gs)
+    {
+        const auto state = getDeferredPresentationState(gs);
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->vram.clear();
+        state->request = {};
+        state->generation = 0u;
+        state->consumedGeneration = 0u;
+    }
 
     GSPrimReg decodePrimRegister(uint64_t value)
     {
@@ -111,8 +146,107 @@ GS::GS()
     reset();
 }
 
+GS::~GS()
+{
+    setAsyncPacketProcessing(false);
+    {
+        std::lock_guard<std::mutex> lock(m_packetMutex);
+        m_packetWorkerStopping = true;
+    }
+    m_packetReady.notify_all();
+    if (m_packetWorker.joinable())
+        m_packetWorker.join();
+}
+
+void GS::setAsyncPacketProcessing(bool enabled)
+{
+    if (enabled)
+    {
+        std::lock_guard<std::mutex> lock(m_packetMutex);
+        if (!m_packetWorker.joinable())
+            m_packetWorker = std::thread([this] { packetWorkerLoop(); });
+        m_asyncPacketProcessing = true;
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_packetMutex);
+        m_asyncPacketProcessing = false;
+    }
+    synchronizePacketProcessing();
+}
+
+void GS::synchronizePacketProcessing()
+{
+    for (;;)
+    {
+        {
+            std::unique_lock<std::mutex> lock(m_packetMutex);
+            if (m_packetQueue.empty() && !m_packetWorkerActive)
+                return;
+            m_packetIdle.wait_for(lock, std::chrono::milliseconds(1));
+        }
+
+        // A packet worker can reach an ordered GPU-to-CPU barrier while the
+        // host thread is synchronizing for presentation. Service context-owned
+        // GPU work between waits so neither side waits on the other forever.
+        processHostWork();
+    }
+}
+
+void GS::processHostWork()
+{
+    std::shared_ptr<GSRasterBackend> backend;
+    {
+        std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+        backend = m_backend;
+    }
+    if (backend)
+        backend->ProcessHostWork();
+}
+
+void GS::shutdownHostResources()
+{
+    std::shared_ptr<GSRasterBackend> backend;
+    {
+        std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+        backend = m_backend;
+    }
+    if (backend)
+        backend->ShutdownHostResources();
+}
+
+void GS::packetWorkerLoop()
+{
+    for (;;)
+    {
+        std::vector<uint8_t> packet;
+        {
+            std::unique_lock<std::mutex> lock(m_packetMutex);
+            m_packetReady.wait(lock, [this] {
+                return m_packetWorkerStopping || !m_packetQueue.empty();
+            });
+            if (m_packetWorkerStopping && m_packetQueue.empty())
+                return;
+            packet = std::move(m_packetQueue.front());
+            m_packetQueue.pop_front();
+            m_packetWorkerActive = true;
+        }
+
+        processGIFPacketImmediate(packet.data(), static_cast<uint32_t>(packet.size()));
+
+        {
+            std::lock_guard<std::mutex> lock(m_packetMutex);
+            m_packetWorkerActive = false;
+            if (m_packetQueue.empty())
+                m_packetIdle.notify_all();
+        }
+    }
+}
+
 void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 {
+    synchronizePacketProcessing();
     m_localMemoryStorage = vram;
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;
@@ -124,7 +258,9 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 
 void GS::reset()
 {
+    synchronizePacketProcessing();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    resetDeferredPresentationState(this);
     std::memset(m_ctx, 0, sizeof(m_ctx));
     m_prim = {};
     m_primRegister = {};
@@ -198,14 +334,19 @@ GSContext &GS::activeContext()
 void GS::snapshotVRAM()
 {
     // Presentation/debug snapshots run outside m_stateMutex so the EE can keep
-    // feeding the GS while a backend performs host-side conversion. Keep the
-    // selected backend alive and unswappable for the duration of the call.
-    std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
-    if (!m_backend)
+    // feeding the GS while a backend performs host-side conversion. Retain a
+    // shared owner without holding the lifetime mutex across a host-thread
+    // completion wait.
+    std::shared_ptr<GSRasterBackend> backend;
+    {
+        std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+        backend = m_backend;
+    }
+    if (!backend)
         return;
     std::vector<uint8_t> snapshot;
-    m_backend->Sync(GSSyncReason::DebugReadback);
-    m_backend->SnapshotVram(snapshot);
+    backend->Sync(GSSyncReason::DebugReadback);
+    backend->SnapshotVram(snapshot);
     std::lock_guard<std::mutex> lock(m_snapshotMutex);
     m_displaySnapshot.swap(snapshot);
 }
@@ -500,6 +641,7 @@ uint32_t GS::getLastDisplayBaseBytes() const
 
 void GS::refreshDisplaySnapshot()
 {
+    synchronizePacketProcessing();
     snapshotVRAM();
 }
 
@@ -526,6 +668,7 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
 
 void GS::latchHostPresentationFrame()
 {
+    synchronizePacketProcessing();
     GSPresentationRequest request{};
     {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -540,39 +683,28 @@ void GS::latchHostPresentationFrame()
         request = buildPresentationRequestUnlocked();
     }
 
-    PresentationFrame frame{};
+    std::shared_ptr<GSRasterBackend> backend;
     {
         std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
-        if (m_backend)
-        {
-            m_backend->Flush();
-            m_backend->Sync(GSSyncReason::Presentation);
-            frame = m_backend->Present(request);
-        }
+        backend = m_backend;
+    }
+    std::vector<uint8_t> snapshot;
+    if (backend)
+    {
+        backend->Flush();
+        backend->Sync(GSSyncReason::Presentation);
+        backend->SnapshotVram(snapshot);
     }
 
-    const bool hasFrame = static_cast<bool>(frame);
-    const uint32_t displayFbp = frame.displayFbp;
-    const uint32_t sourceFbp = frame.sourceFbp;
-    const uint32_t width = frame.width;
-    const uint32_t height = frame.height;
-    const bool usedPreferred = frame.usedPreferred;
-    {
-        std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
-        m_hostPresentationFrame = std::move(frame.pixels);
-        m_hostPresentationWidth = width;
-        m_hostPresentationHeight = height;
-        m_hostPresentationDisplayFbp = displayFbp;
-        m_hostPresentationSourceFbp = sourceFbp;
-        m_hostPresentationUsedPreferred = usedPreferred;
-        m_hasHostPresentationFrame = hasFrame;
-    }
-
-    if (hasFrame)
-    {
-        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-        recordPresentDebugEventUnlocked(displayFbp, sourceFbp, width, height, usedPreferred);
-    }
+    // Preserve the exact completed GS image at the swap boundary, but defer
+    // the costly swizzled-RGBA conversion to the host display thread. If the
+    // guest completes several frames before the next host refresh, retaining
+    // the newest completed frame matches what a physical display observes.
+    const auto deferred = getDeferredPresentationState(this);
+    std::lock_guard<std::mutex> deferredLock(deferred->mutex);
+    deferred->vram = std::move(snapshot);
+    deferred->request = request;
+    ++deferred->generation;
 }
 
 bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
@@ -582,6 +714,61 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t *outSourceFbp,
                                           bool *outUsedPreferred) const
 {
+    std::vector<uint8_t> snapshot;
+    GSPresentationRequest request{};
+    const auto deferred = getDeferredPresentationState(this);
+    {
+        std::lock_guard<std::mutex> deferredLock(deferred->mutex);
+        if (deferred->generation != deferred->consumedGeneration &&
+            !deferred->vram.empty())
+        {
+            snapshot = std::move(deferred->vram);
+            request = deferred->request;
+            deferred->consumedGeneration = deferred->generation;
+        }
+    }
+
+    if (!snapshot.empty())
+    {
+        thread_local GSCpuBackend snapshotBackend;
+        snapshotBackend.Initialize(snapshot.data(), static_cast<uint32_t>(snapshot.size()));
+        PresentationFrame frame = snapshotBackend.Present(request);
+
+        GS *const mutableThis = const_cast<GS *>(this);
+        const bool hasFrame = static_cast<bool>(frame);
+        const uint32_t displayFbp = frame.displayFbp;
+        const uint32_t sourceFbp = frame.sourceFbp;
+        const uint32_t width = frame.width;
+        const uint32_t height = frame.height;
+        const bool usedPreferred = frame.usedPreferred;
+        {
+            std::lock_guard<std::mutex> presentationLock(mutableThis->m_presentationMutex);
+            mutableThis->m_hostPresentationFrame = std::move(frame.pixels);
+            mutableThis->m_hostPresentationWidth = width;
+            mutableThis->m_hostPresentationHeight = height;
+            mutableThis->m_hostPresentationDisplayFbp = displayFbp;
+            mutableThis->m_hostPresentationSourceFbp = sourceFbp;
+            mutableThis->m_hostPresentationUsedPreferred = usedPreferred;
+            mutableThis->m_hasHostPresentationFrame = hasFrame;
+        }
+
+        if (hasFrame)
+        {
+            // Presentation runs on the OpenGL-owning host thread. The packet
+            // worker can hold m_stateMutex while it waits for that same thread
+            // to service an ordered GPU readback, so blocking here would form
+            // a circular wait. This history row is diagnostic-only; skip it
+            // for a contended frame and keep the host command pump alive.
+            std::unique_lock<std::recursive_mutex> stateLock(
+                mutableThis->m_stateMutex, std::try_to_lock);
+            if (stateLock.owns_lock())
+            {
+                mutableThis->recordPresentDebugEventUnlocked(
+                    displayFbp, sourceFbp, width, height, usedPreferred);
+            }
+        }
+    }
+
     std::lock_guard<std::mutex> lock(m_presentationMutex);
     if (!m_hasHostPresentationFrame || m_hostPresentationFrame.empty())
     {
@@ -640,11 +827,28 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    if (!data || sizeBytes < 16u)
+        return;
+    {
+        std::lock_guard<std::mutex> lock(m_packetMutex);
+        if (m_asyncPacketProcessing)
+        {
+            m_packetQueue.emplace_back(data, data + sizeBytes);
+            m_packetReady.notify_one();
+            return;
+        }
+    }
+    processGIFPacketImmediate(data, sizeBytes);
+}
+
+void GS::processGIFPacketImmediate(const uint8_t *data, uint32_t sizeBytes)
+{
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
 
-    if (tryProcessNativeImageUploadPacket(data, sizeBytes))
+    if (std::getenv("PS2X_DISABLE_GS_NATIVE_IMAGE_UPLOAD") == nullptr &&
+        tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
 
     PS2_IF_AGRESSIVE_LOGS({
@@ -725,7 +929,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             if ((nloop * nreg) & 1)
                 offset += 8;
         }
-        else if (flg == GIF_FMT_IMAGE)
+        else if (flg == GIF_FMT_IMAGE || flg == GIF_FMT_IMAGE2)
         {
             uint32_t imageBytes = nloop * 16;
             if (offset + imageBytes > sizeBytes)
@@ -738,6 +942,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    synchronizePacketProcessing();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16u || !m_backend)
         return false;
@@ -783,6 +988,7 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            const uint8_t *data,
                            uint32_t sizeBytes)
 {
+    synchronizePacketProcessing();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
 }
@@ -860,7 +1066,7 @@ bool GS::tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeByt
     const uint64_t imageTagLo = loadLE64(data + offset);
     const uint8_t imageFlg = static_cast<uint8_t>((imageTagLo >> 58u) & 0x3u);
     const uint32_t imageNloop = static_cast<uint32_t>(imageTagLo & 0x7FFFu);
-    if (imageFlg != GIF_FMT_IMAGE || imageNloop == 0u)
+    if ((imageFlg != GIF_FMT_IMAGE && imageFlg != GIF_FMT_IMAGE2) || imageNloop == 0u)
         return false;
 
     offset += 16u;
@@ -1061,6 +1267,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
+    synchronizePacketProcessing();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     writeRegisterUnlocked(regAddr, value);
 }
@@ -1614,24 +1821,28 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
+    synchronizePacketProcessing();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
+    synchronizePacketProcessing();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
 }
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
+    synchronizePacketProcessing();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
 }
 
 void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 {
+    synchronizePacketProcessing();
     if (!backend)
         backend = std::make_unique<GSCpuBackend>();
 
@@ -1667,6 +1878,7 @@ uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint
 
 void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 {
+    synchronizePacketProcessing();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (m_backend)
         m_backend->WriteVram(psm, base, bw, x, y, value);

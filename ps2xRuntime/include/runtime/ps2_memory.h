@@ -317,6 +317,14 @@ public:
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
 
+    using IpuToDmaCallback = std::function<void(uint32_t, uint32_t)>;
+    void setIpuToDmaCallback(IpuToDmaCallback cb) { m_ipuToDmaCallback = std::move(cb); }
+    using IpuToDmaCompletionCallback = std::function<void()>;
+    void setIpuToDmaCompletionCallback(IpuToDmaCompletionCallback cb) { m_ipuToDmaCompletionCallback = std::move(cb); }
+    // Advance DMAC channel 4 by at most maxQwc, matching the eight-QWC IPU
+    // input FIFO. Returns the number of QWC accepted by the host IPU seam.
+    uint32_t pumpIpuToDma(uint32_t maxQwc = 8u);
+
     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
@@ -399,6 +407,15 @@ public:
 
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;
+    IpuToDmaCallback m_ipuToDmaCallback;
+    IpuToDmaCompletionCallback m_ipuToDmaCompletionCallback;
+    struct IpuToDmaState
+    {
+        bool chainMode = false;
+        bool tagInProgress = false;
+        bool endAfterPayload = false;
+    };
+    IpuToDmaState m_ipuToDmaState{};
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
 
@@ -407,6 +424,8 @@ public:
     uint8_t *m_vu1Code = nullptr;
     uint8_t *m_vu1Data = nullptr;
     bool m_path3Masked = false;
+    uint32_t m_vif1PendingDirectQwc = 0u;
+    bool m_vif1PendingDirectHl = false;
     uint32_t m_vif1PendingPath2ImageQwc = 0u;
     bool m_vif1PendingPath2DirectHl = false;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
@@ -450,6 +469,7 @@ public:
 
     std::array<EeTimer, 4> m_eeTimers{};
     void queueCompletedDmacCause(uint32_t cause);
+    void completeIpuToDma();
 };
 
 #endif // PS2_MEMORY_H

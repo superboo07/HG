@@ -120,7 +120,7 @@ public:
         m_beforeEach = fn;
     }
 
-    static int Run()
+    static int Run(const std::string& suiteFilter = {})
     {
         int failedCount = 0;
         int totalTests = 0;
@@ -129,6 +129,11 @@ public:
         {
             const std::string& suiteName = c.first;
             const TestCaseCallback& suiteCallback = c.second;
+
+            if (!suiteFilter.empty() && suiteName != suiteFilter)
+            {
+                continue;
+            }
 
             std::cout << "\n[Suite]: " << suiteName << std::endl;
 

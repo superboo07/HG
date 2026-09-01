@@ -14,7 +14,9 @@ add_library(ps2_iop STATIC
     src/modules/tsnddrv.cpp
     src/modules/cri_dtx.cpp
     src/modules/clfile.cpp
+    src/modules/cd_search_file.cpp
     src/modules/sound_update_stub.cpp
+    src/modules/capcom_snddrv_transfer.cpp
     src/modules/sdrdrv.cpp
 )
 

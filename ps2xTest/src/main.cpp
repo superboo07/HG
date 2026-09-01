@@ -20,7 +20,7 @@ void register_ps2_recompiler_tests();
 void register_ps2_runtime_expansion_tests();
 void reset_ps2_test_function_table();
 
-int main()
+int main(int argc, char** argv)
 {
     MiniTest::BeforeEach(reset_ps2_test_function_table);
 
@@ -40,7 +40,8 @@ int main()
     register_ps2_sif_dma_tests();
     register_ps2_recompiler_tests();
     register_ps2_runtime_expansion_tests();
-    int res = MiniTest::Run();
+    const std::string suiteFilter = argc > 1 ? argv[1] : "";
+    int res = MiniTest::Run(suiteFilter);
     std::cout.flush();
     std::cerr.flush();
     std::_Exit(res);

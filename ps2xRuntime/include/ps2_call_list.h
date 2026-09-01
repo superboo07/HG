@@ -494,6 +494,19 @@
     X(scePadSetVrefParam)                     \
     X(scePadSetWarningLevel)                  \
     X(scePadStateIntToStr)                    \
+    X(scePad2Init)                            \
+    X(scePad2End)                             \
+    X(scePad2CreateSocket)                    \
+    X(scePad2DeleteSocket)                    \
+    X(scePad2Read)                            \
+    X(scePad2GetButtonProfile)                \
+    X(scePad2GetState)                        \
+    X(scePad2GetButtonInfo)                   \
+    X(scePad2InitDmaDBuff)                    \
+    X(scePad2LinkDriver)                      \
+    X(scePad2GetSide)                         \
+    X(scePad2CheckDma)                        \
+    X(scePad2SetButtonOrder)                  \
     X(scePrintf)                              \
     X(sceRead)                                \
     X(sceResetttyinit)                        \

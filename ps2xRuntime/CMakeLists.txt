@@ -17,6 +17,15 @@ option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through ru
 option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" ON)
 option(PS2X_ENABLE_DEBUG_UI "Build the desktop runtime debug UI" ON)
 
+if(WIN32 OR (UNIX AND NOT APPLE))
+    set(PS2X_OPENGL_43_DEFAULT ON)
+else()
+    set(PS2X_OPENGL_43_DEFAULT OFF)
+endif()
+option(PS2X_ENABLE_OPENGL_43_GS
+    "Request an OpenGL 4.3 context for the optional compute-capable GS backend"
+    ${PS2X_OPENGL_43_DEFAULT})
+
 if(PS2X_ENABLE_SCCACHE)
     find_program(PS2X_SCCACHE_PROGRAM sccache)
 
@@ -67,6 +76,11 @@ if(PS2X_IS_VITA)
     include("${PS2X_VITASDK}/share/vita.cmake" REQUIRED)
 else()
     include(FetchContent)
+    if(PS2X_ENABLE_OPENGL_43_GS)
+        # Raylib otherwise requests a 3.3 context even on newer hardware. Keep
+        # this optional so macOS and older hosts retain the CPU/3.3 fallback.
+        set(OPENGL_VERSION "4.3" CACHE STRING "Raylib OpenGL context version" FORCE)
+    endif()
     set(FETCHCONTENT_QUIET FALSE)
     set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
@@ -383,6 +397,11 @@ add_library(ps2_runtime STATIC
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
+    src/lib/gs/gs_opengl_compute.cpp
+    src/lib/gs/gs_opengl_mapping_probe.cpp
+    src/lib/gs/gs_opengl_t8_probe.cpp
+    src/lib/gs/gs_opengl_live_capture_probe.cpp
+    src/lib/gs/gs_opengl_hybrid_backend.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
@@ -496,7 +515,7 @@ if(PS2X_DEFAULT_BOOT_ELF_DEFINE)
 endif()
 
 if(MSVC)
-    target_compile_options(ps2EntryRunner PRIVATE /FS)
+    target_compile_options(ps2EntryRunner PRIVATE /FS /MP4)
 endif()
 
 target_include_directories(ps2_runtime PUBLIC
@@ -552,9 +571,14 @@ if(PS2X_IS_VITA)
     endif()
 endif()
 
-if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+if(CMAKE_CONFIGURATION_TYPES OR
+   CMAKE_BUILD_TYPE STREQUAL "Release" OR
+   CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_runtime)
-    EnableFastReleaseMode(ps2EntryRunner)
+    # Keep the very large generated game target on the generator's normal /O2
+    # Release path.  Applying /GL to every emitted translation unit makes each
+    # runtime-only experiment pay a multi-minute whole-game LTCG link, while
+    # the measured VIF/VU hotspot lives in ps2_runtime.
 
     if(WIN32 AND NOT PS2X_SHOW_WINDOWS_CONSOLE)
         if(MSVC)

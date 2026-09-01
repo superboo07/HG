@@ -231,6 +231,7 @@ enum class EeEventType : uint8_t
     Dmac,
     ExternalWake,
     Alarm,
+    HostCallback,
 };
 
 struct EeEvent
@@ -310,6 +311,7 @@ public:
 
     int setAlarm(uint16_t ticks, uint32_t handler, uint32_t argument, uint32_t gp, uint32_t sp);
     int cancelAlarm(int id);
+    void scheduleHostCallback(std::chrono::microseconds delay, std::function<void()> callback);
     void queueInvocation(GuestInvocation invocation);
     [[noreturn]] void invokeCurrent(GuestInvocation invocation);
     [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
@@ -380,6 +382,7 @@ private:
     void processPendingEvents();
     void processDueDeadlines();
     void processEvent(const EeEvent &event);
+    [[nodiscard]] bool hasScheduledInvocation(GuestInvocationKind kind, uint64_t tag) const;
     void finishEventWaiters(EeEventFlag &flag, bool interruptSafe);
     [[nodiscard]] static bool eventCondition(uint32_t current, uint32_t requested, uint32_t mode);
     static int waitObjectId(const EeWaitState &wait);
@@ -398,6 +401,7 @@ private:
     std::unordered_map<int, EeSemaphore> m_semaphores;
     std::unordered_map<int, EeEventFlag> m_eventFlags;
     std::unordered_map<int, EeAlarm> m_alarms;
+    std::unordered_map<uint32_t, std::function<void()>> m_hostCallbacks;
     std::unordered_map<int, EeIrqHandler> m_intcHandlers;
     std::unordered_map<int, EeIrqHandler> m_dmacHandlers;
     int m_nextThreadId = kFirstThreadId;
@@ -405,6 +409,7 @@ private:
     int m_nextSemaphoreId = 1;
     int m_nextEventFlagId = 1;
     int m_nextAlarmId = 1;
+    uint32_t m_nextHostCallbackId = 1u;
     int m_nextIntcHandlerId = 1;
     int m_nextDmacHandlerId = 1;
     int m_intcHeadOrder = 0;

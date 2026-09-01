@@ -5,6 +5,7 @@
 #include "ps2recomp/types.h"
 #include "ps2_runtime.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_audio_adpcm.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
 #include "runtime/gs/gs_frontend.h"
@@ -315,6 +316,83 @@ void register_ps2_runtime_expansion_tests()
 {
     MiniTest::Case("PS2RuntimeExpansion", [](TestCase &tc)
     {
+        tc.Run("Sony ADPCM block decoding preserves predictor history across stream chunks", [](TestCase &t)
+        {
+            std::array<uint8_t, 32> blocks{};
+            blocks[0] = 0x0Cu; // filter 0, shift 12
+            for (size_t index = 2u; index < 16u; ++index)
+                blocks[index] = static_cast<uint8_t>(0x71u + (index & 1u));
+            blocks[16] = 0x1Cu; // filter 1, shift 12
+
+            Ps2AdpcmDecoderState combinedState{};
+            std::vector<int16_t> combined;
+            t.IsTrue(ps2_adpcm::decodeBlocks(blocks.data(),
+                                              blocks.size(),
+                                              combinedState,
+                                              combined),
+                     "two complete blocks should decode");
+            t.Equals(combined.size(), size_t{56u},
+                     "each Sony ADPCM block should produce 28 PCM samples");
+
+            Ps2AdpcmDecoderState splitState{};
+            std::vector<int16_t> first;
+            std::vector<int16_t> second;
+            t.IsTrue(ps2_adpcm::decodeBlocks(blocks.data(), 16u, splitState, first),
+                     "the first stream chunk should decode");
+            t.IsTrue(ps2_adpcm::decodeBlocks(blocks.data() + 16u, 16u, splitState, second),
+                     "the following stream chunk should decode with retained history");
+            first.insert(first.end(), second.begin(), second.end());
+            t.IsTrue(first == combined,
+                     "split decoding should be byte-stable with contiguous decoding");
+
+            std::vector<int16_t> malformed;
+            t.IsFalse(ps2_adpcm::decodeBlocks(blocks.data(), 15u, splitState, malformed),
+                      "a partial ADPCM block must be rejected");
+        });
+
+        tc.Run("PMFHL moves both HI/LO accumulator pairs in R5900 lane order", [](TestCase &t)
+        {
+            constexpr uint64_t hi = 0x2222222211111111ull;
+            constexpr uint64_t lo = 0x4444444433333333ull;
+            constexpr uint64_t hi1 = 0x6666666655555555ull;
+            constexpr uint64_t lo1 = 0x8888888877777777ull;
+
+            uint32_t words[4]{};
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(words), PS2_PMFHL_LW(hi, lo, hi1, lo1));
+            t.Equals(words[0], 0x33333333u, "PMFHL.LW lane 0 should be LO[0]");
+            t.Equals(words[1], 0x11111111u, "PMFHL.LW lane 1 should be HI[0]");
+            t.Equals(words[2], 0x77777777u, "PMFHL.LW lane 2 should be LO[2]");
+            t.Equals(words[3], 0x55555555u, "PMFHL.LW lane 3 should be HI[2]");
+
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(words), PS2_PMFHL_UW(hi, lo, hi1, lo1));
+            t.Equals(words[0], 0x44444444u, "PMFHL.UW lane 0 should be LO[1]");
+            t.Equals(words[1], 0x22222222u, "PMFHL.UW lane 1 should be HI[1]");
+            t.Equals(words[2], 0x88888888u, "PMFHL.UW lane 2 should be LO[3]");
+            t.Equals(words[3], 0x66666666u, "PMFHL.UW lane 3 should be HI[3]");
+        });
+
+        tc.Run("PMFHL.LW reconstructs a scalar MULTU result", [](TestCase &t)
+        {
+            constexpr uint64_t product = 0x413B6CCCCCCCCCCDull;
+            const uint64_t lo = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(product)));
+            const uint64_t hi = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(product >> 32)));
+
+            uint64_t lanes[2]{};
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(lanes), PS2_PMFHL_LW(hi, lo, 0u, 0u));
+            t.Equals(lanes[0], product, "PMFHL.LW should interleave the low HI/LO words into the original 64-bit product");
+        });
+
+        tc.Run("PMFHL codegen supplies both accumulator pairs", [](TestCase &t)
+        {
+            R5900Decoder decoder;
+            CodeGenerator generator({}, {});
+            const uint32_t raw = (OPCODE_MMI << 26) | (3u << 11) | (PMFHL_LW << 6) | MMI_PMFHL;
+            const Instruction inst = decoder.decodeInstruction(0x1000u, raw);
+            const std::string generated = generator.translateInstruction(inst);
+            t.IsTrue(generated.find("PS2_PMFHL_LW(ctx->hi, ctx->lo, ctx->hi1, ctx->lo1)") != std::string::npos,
+                     "PMFHL.LW codegen should supply both R5900 accumulator pairs");
+        });
+
         tc.Run("differential decoder/codegen gpr-write contract for MULT and DIV families", [](TestCase &t)
         {
             R5900Decoder decoder;
@@ -753,6 +831,111 @@ void register_ps2_runtime_expansion_tests()
                      "resumed GetPicture should publish the configured height");
         });
 
+        tc.Run("terminal IPU-to DMA completion finalizes a seen MPEG sequence end", [](TestCase &t)
+        {
+            constexpr uint32_t kMpegHandle = 0x00124000u;
+            constexpr uint32_t kSequenceAddr = 0x00125000u;
+            const std::array<uint8_t, 12> sequence = {
+                0x00u, 0x00u, 0x01u, 0xB3u, 0x20u, 0x01u, 0xE0u, 0x14u,
+                0x00u, 0x00u, 0x01u, 0xB7u};
+
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+            std::memcpy(rdram.data() + kSequenceAddr, sequence.data(), sequence.size());
+            Ps2FastWrite32(rdram.data(), 0x001717BCu, kMpegHandle);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, kMpegHandle);
+            setRegU32(addCtx, 5, kSequenceAddr);
+            setRegU32(addCtx, 6, static_cast<uint32_t>(sequence.size()));
+            ps2_stubs::sceMpegAddBs(rdram.data(), &addCtx, &runtime);
+            t.Equals(getRegS32(addCtx, 2), static_cast<int32_t>(sequence.size()),
+                     "elementary stream bytes should be accepted");
+
+            R5900Context beforeCtx{};
+            setRegU32(beforeCtx, 4, kMpegHandle);
+            ps2_stubs::sceMpegIsEnd(rdram.data(), &beforeCtx, &runtime);
+            t.Equals(getRegS32(beforeCtx, 2), 0,
+                     "sequence end alone should not finalize before terminal DMA completion");
+
+            ps2_stubs::notifyMpegIpuToDmaComplete(rdram.data(), &runtime);
+
+            R5900Context afterCtx{};
+            setRegU32(afterCtx, 4, kMpegHandle);
+            ps2_stubs::sceMpegIsEnd(rdram.data(), &afterCtx, &runtime);
+            t.Equals(getRegS32(afterCtx, 2), 1,
+                     "terminal IPU-to DMA completion should finalize the ended sequence");
+        });
+
+        tc.Run("inactive IPU-to DMA finalizes a drained MPEG sequence end", [](TestCase &t)
+        {
+            constexpr uint32_t kMpegHandle = 0x00124000u;
+            constexpr uint32_t kSequenceAddr = 0x00125000u;
+            constexpr uint32_t kImageAddr = 0x00126000u;
+            const std::array<uint8_t, 12> sequence = {
+                0x00u, 0x00u, 0x01u, 0xB3u, 0x20u, 0x01u, 0xE0u, 0x14u,
+                0x00u, 0x00u, 0x01u, 0xB7u};
+
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+            std::memcpy(rdram.data() + kSequenceAddr, sequence.data(), sequence.size());
+            Ps2FastWrite32(rdram.data(), 0x001717BCu, kMpegHandle);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, kMpegHandle);
+            setRegU32(addCtx, 5, kSequenceAddr);
+            setRegU32(addCtx, 6, static_cast<uint32_t>(sequence.size()));
+            ps2_stubs::sceMpegAddBs(rdram.data(), &addCtx, &runtime);
+
+            R5900Context beforeCtx{};
+            setRegU32(beforeCtx, 4, kMpegHandle);
+            ps2_stubs::sceMpegIsEnd(rdram.data(), &beforeCtx, &runtime);
+            t.Equals(getRegS32(beforeCtx, 2), 0,
+                     "sequence end alone should remain incomplete before the producer is observed inactive");
+
+            R5900Context pictureCtx{};
+            setRegU32(pictureCtx, 4, kMpegHandle);
+            setRegU32(pictureCtx, 5, kImageAddr);
+            ps2_stubs::sceMpegGetPicture(rdram.data(), &pictureCtx, &runtime);
+            t.Equals(getRegS32(pictureCtx, 2), 0,
+                     "GetPicture should complete without parking after the stopped producer drains");
+
+            R5900Context afterCtx{};
+            setRegU32(afterCtx, 4, kMpegHandle);
+            ps2_stubs::sceMpegIsEnd(rdram.data(), &afterCtx, &runtime);
+            t.Equals(getRegS32(afterCtx, 2), 1,
+                     "inactive IPU-to DMA should finalize a drained sequence end");
+        });
+
+        tc.Run("stale CD EOF is scoped to CD-fed MPEG playback", [](TestCase &t)
+        {
+            constexpr uint32_t kMpegHandle = 0x00124000u;
+            constexpr uint32_t kDataAddr = 0x00125000u;
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+            ps2_stubs::notifyMpegCdStreamStart();
+            ps2_stubs::notifyMpegCdStreamEof();
+
+            R5900Context createCtx{};
+            setRegU32(createCtx, 4, kMpegHandle);
+            setRegU32(createCtx, 5, 0x00130000u);
+            setRegU32(createCtx, 6, 0x2000u);
+            ps2_stubs::sceMpegCreate(rdram.data(), &createCtx, &runtime);
+            t.IsTrue(!ps2_stubs::mpegCdEofAppliesForTesting(kMpegHandle),
+                     "a fresh direct MPEG handle must not inherit an older CD EOF");
+
+            R5900Context demuxCtx{};
+            setRegU32(demuxCtx, 4, kMpegHandle);
+            setRegU32(demuxCtx, 5, kDataAddr);
+            setRegU32(demuxCtx, 6, 3u);
+            ps2_stubs::sceMpegDemuxPss(rdram.data(), &demuxCtx, &runtime);
+            t.IsTrue(ps2_stubs::mpegCdEofAppliesForTesting(kMpegHandle),
+                     "the same EOF must apply after the handle consumes CD-demux input");
+        });
+
         tc.Run("sceMpegGetPicture waits for new decoder output instead of duplicating the last frame", [](TestCase &t)
         {
             PS2Runtime runtime;
@@ -1103,6 +1286,139 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(mem.vif1_regs.tops, 4u, "DBF=0 should make TOPS=BASE");
             t.Equals(mem.vif1_regs.top, 6u, "MSCNT should latch TOP from current TOPS before toggling");
             t.Equals(mem.vif1_regs.itop, 0x21u, "MSCNT should keep latching ITOP from ITOPS");
+        });
+
+        tc.Run("IPU-to normal DMA advances through eight-QWC FIFO loads", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            std::vector<std::pair<uint32_t, uint32_t>> spans;
+            mem.setIpuToDmaCallback([&](uint32_t madr, uint32_t qwc)
+            {
+                spans.emplace_back(madr, qwc);
+            });
+
+            constexpr uint32_t kIpuToBase = 0x1000B400u;
+            mem.writeIORegister(kIpuToBase + 0x10u, 0x00123450u);
+            mem.writeIORegister(kIpuToBase + 0x20u, 0x10037u);
+            mem.writeIORegister(kIpuToBase, 0x100u);
+
+            t.Equals(spans.size(), static_cast<size_t>(1u), "start should fill the FIFO once");
+            t.Equals(spans[0].first, 0x00123450u, "first FIFO load should use initial MADR");
+            t.Equals(spans[0].second, 8u, "first FIFO load should be eight QWC");
+            t.Equals(mem.readIORegister(kIpuToBase + 0x10u), 0x001234D0u, "MADR should advance by accepted bytes");
+            t.Equals(mem.readIORegister(kIpuToBase + 0x20u), 0x2Fu, "QWC should retain the unaccepted remainder");
+            t.IsTrue((mem.readIORegister(kIpuToBase) & 0x100u) != 0u, "CHCR read should preserve active STR");
+
+            mem.writeIORegister(kIpuToBase, 0x104u);
+            t.Equals(spans.size(), static_cast<size_t>(1u), "active CHCR restart should be ignored");
+            t.Equals(mem.readIORegister(kIpuToBase + 0x20u), 0x2Fu, "ignored restart should preserve QWC");
+
+            while ((mem.readIORegister(kIpuToBase) & 0x100u) != 0u)
+                mem.pumpIpuToDma(8u);
+
+            t.Equals(spans.size(), static_cast<size_t>(7u), "55 QWC should require seven FIFO loads");
+            t.Equals(spans.back().first, 0x00123750u, "final load should begin after 48 QWC");
+            t.Equals(spans.back().second, 7u, "final load should contain the seven-QWC remainder");
+            t.Equals(mem.readIORegister(kIpuToBase + 0x20u), 0u, "completion should clear QWC");
+            t.IsTrue((mem.readIORegister(0x1000E010u) & (1u << 4u)) != 0u, "completion should raise channel-4 D_STAT");
+            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
+            t.Equals(causes.size(), static_cast<size_t>(1u), "completion should queue one DMAC cause");
+            t.Equals(causes[0], 4u, "completion should identify channel 4");
+        });
+
+        tc.Run("IPU-to REF chain preserves partial tag state and exact spans", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            std::vector<std::pair<uint32_t, uint32_t>> spans;
+            mem.setIpuToDmaCallback([&](uint32_t madr, uint32_t qwc)
+            {
+                spans.emplace_back(madr, qwc);
+            });
+
+            constexpr uint32_t kIpuToBase = 0x1000B400u;
+            constexpr uint32_t kTagAddr = 0x00130000u;
+            constexpr uint32_t kRefData = 0x00140000u;
+            const uint64_t refTag = 0x80ull | (3ull << 28u) |
+                                    (static_cast<uint64_t>(kRefData) << 32u);
+            const uint64_t endTag = 2ull | (7ull << 28u);
+            mem.write64(kTagAddr, refTag);
+            mem.write64(kTagAddr + 8u, 0u);
+            mem.write64(kTagAddr + 16u, endTag);
+            mem.write64(kTagAddr + 24u, 0u);
+            mem.writeIORegister(kIpuToBase + 0x30u, kTagAddr);
+            mem.writeIORegister(kIpuToBase + 0x20u, 0u);
+            mem.writeIORegister(kIpuToBase, 0x104u);
+
+            t.Equals(spans.size(), static_cast<size_t>(1u), "chain start should publish one FIFO load");
+            t.Equals(spans[0].first, kRefData, "REF should select its referenced payload");
+            t.Equals(spans[0].second, 8u, "REF payload should be FIFO paced");
+            t.Equals(mem.readIORegister(kIpuToBase + 0x10u), kRefData + 0x80u, "partial REF should advance MADR");
+            t.Equals(mem.readIORegister(kIpuToBase + 0x20u), 0x78u, "partial REF should preserve remaining QWC");
+            t.Equals(mem.readIORegister(kIpuToBase + 0x30u), kTagAddr + 16u, "TADR should already point to the next tag");
+            t.IsTrue((mem.readIORegister(kIpuToBase) & 0x100u) != 0u, "partial REF should keep STR active");
+
+            for (uint32_t index = 1u; index < 16u; ++index)
+                mem.pumpIpuToDma(8u);
+            t.Equals(spans.size(), static_cast<size_t>(16u), "REF payload should be delivered exactly once in sixteen loads");
+            t.IsTrue((mem.readIORegister(kIpuToBase) & 0x100u) != 0u, "nonterminal REF completion should retain STR");
+            t.Equals(mem.readIORegister(kIpuToBase + 0x20u), 0u, "completed REF should leave no payload remainder");
+
+            mem.pumpIpuToDma(8u);
+            t.Equals(spans.size(), static_cast<size_t>(17u), "terminal END payload should add exactly one span");
+            t.Equals(spans.back().first, kTagAddr + 32u, "END should select its inline payload");
+            t.Equals(spans.back().second, 2u, "END should preserve its exact QWC");
+            t.IsTrue((mem.readIORegister(kIpuToBase) & 0x100u) == 0u, "terminal payload should clear STR");
+            for (uint32_t index = 0u; index < 16u; ++index)
+            {
+                t.Equals(spans[index].first, kRefData + index * 0x80u, "REF loads should be contiguous and nonduplicated");
+                t.Equals(spans[index].second, 8u, "every REF FIFO load should be eight QWC");
+            }
+        });
+
+        tc.Run("IPU-to chain resume drains restored payload before next tag", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            std::vector<std::pair<uint32_t, uint32_t>> spans;
+            mem.setIpuToDmaCallback([&](uint32_t madr, uint32_t qwc)
+            {
+                spans.emplace_back(madr, qwc);
+            });
+
+            constexpr uint32_t kIpuToBase = 0x1000B400u;
+            constexpr uint32_t kResumeData = 0x00150000u;
+            constexpr uint32_t kNextTag = 0x00160000u;
+            constexpr uint32_t kNextData = 0x00170000u;
+            const uint64_t endTag = 2ull | (7ull << 28u) |
+                                    (static_cast<uint64_t>(kNextData) << 32u);
+            mem.write64(kNextTag, endTag);
+            mem.write64(kNextTag + 8u, 0u);
+            mem.writeIORegister(kIpuToBase + 0x10u, kResumeData);
+            mem.writeIORegister(kIpuToBase + 0x20u, 0x10u);
+            mem.writeIORegister(kIpuToBase + 0x30u, kNextTag);
+            mem.writeIORegister(kIpuToBase, 0x104u);
+
+            t.Equals(spans.size(), static_cast<size_t>(1u), "resume should publish one FIFO load");
+            t.Equals(spans[0].first, kResumeData, "resume should begin at restored MADR");
+            t.Equals(spans[0].second, 8u, "resume should remain FIFO paced");
+            t.Equals(mem.readIORegister(kIpuToBase + 0x20u), 8u, "resume should retain restored payload remainder");
+            t.Equals(mem.readIORegister(kIpuToBase + 0x30u), kNextTag, "resume must not consume the next tag early");
+
+            mem.pumpIpuToDma(8u);
+            t.Equals(spans.size(), static_cast<size_t>(2u), "second load should finish restored payload");
+            t.Equals(spans[1].first, kResumeData + 0x80u, "restored payload loads should be contiguous");
+            t.Equals(mem.readIORegister(kIpuToBase + 0x30u), kNextTag, "TADR should remain on next tag until restored payload completes");
+
+            mem.pumpIpuToDma(8u);
+            t.Equals(spans.size(), static_cast<size_t>(3u), "next pump should consume the terminal tag");
+            t.Equals(spans[2].first, kNextTag + 16u, "END tag should select its inline payload");
+            t.Equals(spans[2].second, 2u, "END tag should retain exact QWC");
+            t.IsTrue((mem.readIORegister(kIpuToBase) & 0x100u) == 0u, "terminal tag should complete channel");
         });
 
         tc.Run("VU0 microprogram executes against VU0 code and data memory", [](TestCase &t)

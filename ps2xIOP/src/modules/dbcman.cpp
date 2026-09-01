@@ -66,6 +66,19 @@ namespace ps2x::iop::detail
                     return result;
                 }
 
+                // libdbc uses word 2 of this shared request/response buffer as
+                // the returned payload length. Leaving the request word there
+                // makes the EE client copy an attacker-sized payload from the
+                // fixed 0x90-byte RPC buffer. Unsupported commands therefore
+                // complete with an explicit empty response.
+                if (request.receive.size >= 3u * sizeof(uint32_t))
+                {
+                    constexpr uint32_t emptyPayloadSize = 0u;
+                    (void)m_host.writeGuest(request.receive.address + 2u * sizeof(uint32_t),
+                                            &emptyPayloadSize,
+                                            sizeof(emptyPayloadSize));
+                }
+
                 bool shouldLog = false;
                 {
                     std::lock_guard<std::mutex> lock(m_mutex);

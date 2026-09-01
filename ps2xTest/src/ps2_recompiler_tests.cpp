@@ -787,6 +787,41 @@ void register_ps2_recompiler_tests()
             }
         });
 
+        tc.Run("data function pointers create internal entry wrappers", [](TestCase &t) {
+            uint32_t pointerWords[] = {0x1008u, 0x1008u, 0x1008u, 0xDEADBEEFu};
+            std::vector<Section> sections = {
+                {".text", 0x1000u, 0x1000u, 0u, true, false, false, true, nullptr},
+                {".data", 0x3000u, static_cast<uint32_t>(sizeof(pointerWords)), 0u,
+                 false, true, false, false, reinterpret_cast<uint8_t *>(pointerWords)}
+            };
+
+            std::vector<Function> functions = {
+                makeFunction("shared_tail_owner", 0x1000u, 0x1018u)
+            };
+            std::unordered_map<uint32_t, std::vector<Instruction>> decodedFunctions;
+            decodedFunctions[0x1000u] = {
+                makeNopLike(0x1000u),
+                makeNopLike(0x1004u),
+                makeNopLike(0x1008u),
+                makeNopLike(0x100Cu),
+                makeJrRa(0x1010u),
+                makeNopLike(0x1014u)
+            };
+
+            const size_t discovered = PS2Recompiler::DiscoverAdditionalEntryPoints(
+                functions, decodedFunctions, sections);
+            t.Equals(discovered, static_cast<size_t>(1),
+                     "one data-referenced internal entry should be discovered");
+
+            const auto entryIt = std::find_if(functions.begin(), functions.end(),
+                                              [](const Function &fn) { return fn.start == 0x1008u; });
+            t.IsTrue(entryIt != functions.end(), "data pointer target should receive an entry wrapper");
+            if (entryIt != functions.end())
+            {
+                t.Equals(entryIt->end, 0x1018u, "entry wrapper should retain the shared tail");
+            }
+        });
+
         tc.Run("config manager parses jump_tables table entries", [](TestCase &t) {
             const auto uniqueSuffix = std::to_string(
                 static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()));

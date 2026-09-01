@@ -1,9 +1,62 @@
+#include <algorithm>
 #include <array>
 
 #include "runtime/gs/ps2_gs_memory.h"
 
 namespace GSMem
 {
+    namespace
+    {
+        constexpr u32 kPagesInVram = static_cast<u32>(MEMORY_SIZE / GS_PAGE_SIZE);
+        constexpr u32 kWordsPerPage = static_cast<u32>(GS_PAGE_SIZE / sizeof(u32));
+
+        void FillPageRun32(u8* data, u32 firstPage, u32 pageCount,
+                           u32 value, bool preserveHighByte)
+        {
+            while (pageCount != 0u)
+            {
+                const u32 wrappedPage = firstPage % kPagesInVram;
+                const u32 chunkPages = std::min(pageCount, kPagesInVram - wrappedPage);
+                u32* words = reinterpret_cast<u32*>(data) + wrappedPage * kWordsPerPage;
+                const size_t wordCount = static_cast<size_t>(chunkPages) * kWordsPerPage;
+                if (preserveHighByte)
+                {
+                    const u32 low24 = value & 0x00FFFFFFu;
+                    for (size_t i = 0; i < wordCount; ++i)
+                        words[i] = (words[i] & 0xFF000000u) | low24;
+                }
+                else
+                {
+                    std::fill_n(words, wordCount, value);
+                }
+                firstPage += chunkPages;
+                pageCount -= chunkPages;
+            }
+        }
+
+        bool TryFillAlignedPageRect32(u8* data, u32 bp, u32 bw,
+                                      u32 x0, u32 y0, u32 x1, u32 y1,
+                                      u32 value, bool preserveHighByte)
+        {
+            constexpr u32 pageWidth = 64u;
+            constexpr u32 pageHeight = 32u;
+            if (bw == 0u || (bp % BLOCKS_PER_PAGE) != 0u ||
+                (x0 % pageWidth) != 0u || ((x1 + 1u) % pageWidth) != 0u ||
+                (y0 % pageHeight) != 0u || ((y1 + 1u) % pageHeight) != 0u)
+                return false;
+
+            const u32 pageColumns = (x1 - x0 + 1u) / pageWidth;
+            const u32 pageRows = (y1 - y0 + 1u) / pageHeight;
+            const u32 pageStride = bw;
+            const u32 firstPage = bp / BLOCKS_PER_PAGE +
+                                  (y0 / pageHeight) * pageStride + x0 / pageWidth;
+            for (u32 row = 0; row < pageRows; ++row)
+                FillPageRun32(data, firstPage + row * pageStride,
+                              pageColumns, value, preserveHighByte);
+            return true;
+        }
+    }
+
     using C32Traits  = PixelStorageTraits<C32>;
     using Z32Traits  = PixelStorageTraits<Z32>;
     using C16Traits  = PixelStorageTraits<C16>;
@@ -225,9 +278,39 @@ namespace GSMem
         PixelStorageTraits<C32>::Write(PageTableC32, data, bp, bw, x, y, value);
     }
 
+    u32 AddressCT32(u32 bp, u32 bw, u32 x, u32 y)
+    {
+        const u32 pixelAddress = PixelStorageTraits<C32>::Address(PageTableC32, bp, bw, x, y);
+        return (pixelAddress * sizeof(u32)) & (MEMORY_SIZE - sizeof(u32));
+    }
+
+    void FillRectCT32(u8* data, u32 bp, u32 bw,
+                      u32 x0, u32 y0, u32 x1, u32 y1, u32 value)
+    {
+        if (TryFillAlignedPageRect32(data, bp, bw, x0, y0, x1, y1, value, false))
+            return;
+        for (u32 y = y0; y <= y1; ++y)
+        {
+            for (u32 x = x0; x <= x1; ++x)
+                PixelStorageTraits<C32>::Write(PageTableC32, data, bp, bw, x, y, value);
+        }
+    }
+
     void WriteCT24(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)
     {
         PixelStorageTraits<C24>::Write(PageTableC32, data, bp, bw, x, y, value);
+    }
+
+    void FillRectCT24(u8* data, u32 bp, u32 bw,
+                      u32 x0, u32 y0, u32 x1, u32 y1, u32 value)
+    {
+        if (TryFillAlignedPageRect32(data, bp, bw, x0, y0, x1, y1, value, true))
+            return;
+        for (u32 y = y0; y <= y1; ++y)
+        {
+            for (u32 x = x0; x <= x1; ++x)
+                PixelStorageTraits<C24>::Write(PageTableC32, data, bp, bw, x, y, value);
+        }
     }
 
     void WriteZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)
@@ -235,9 +318,39 @@ namespace GSMem
         PixelStorageTraits<Z32>::Write(PageTableZ32, data, bp, bw, x, y, value);
     }
 
+    u32 AddressZ32(u32 bp, u32 bw, u32 x, u32 y)
+    {
+        const u32 pixelAddress = PixelStorageTraits<Z32>::Address(PageTableZ32, bp, bw, x, y);
+        return (pixelAddress * sizeof(u32)) & (MEMORY_SIZE - sizeof(u32));
+    }
+
+    void FillRectZ32(u8* data, u32 bp, u32 bw,
+                     u32 x0, u32 y0, u32 x1, u32 y1, u32 value)
+    {
+        if (TryFillAlignedPageRect32(data, bp, bw, x0, y0, x1, y1, value, false))
+            return;
+        for (u32 y = y0; y <= y1; ++y)
+        {
+            for (u32 x = x0; x <= x1; ++x)
+                PixelStorageTraits<Z32>::Write(PageTableZ32, data, bp, bw, x, y, value);
+        }
+    }
+
     void WriteZ24(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)
     {
         PixelStorageTraits<Z24>::Write(PageTableZ32, data, bp, bw, x, y, value);
+    }
+
+    void FillRectZ24(u8* data, u32 bp, u32 bw,
+                     u32 x0, u32 y0, u32 x1, u32 y1, u32 value)
+    {
+        if (TryFillAlignedPageRect32(data, bp, bw, x0, y0, x1, y1, value, true))
+            return;
+        for (u32 y = y0; y <= y1; ++y)
+        {
+            for (u32 x = x0; x <= x1; ++x)
+                PixelStorageTraits<Z24>::Write(PageTableZ32, data, bp, bw, x, y, value);
+        }
     }
 
     void WriteCT16(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)

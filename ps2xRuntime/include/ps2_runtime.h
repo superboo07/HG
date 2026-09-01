@@ -3,6 +3,9 @@
 
 #include <cstring>
 #include <cstdint>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 #include <string>
 #include <functional>
@@ -219,6 +222,109 @@ inline void setReturnU64(R5900Context *ctx, uint64_t value)
 inline constexpr uint32_t PS2_PATH_WATCH_ADDR = 0x01EFFFA0u;
 inline constexpr uint32_t PS2_PATH_WATCH_BYTES = 0x200u;
 
+inline bool ps2GuestWriteWatchAddress(uint32_t &address)
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("PS2X_TRACE_GUEST_WRITE");
+        if (value == nullptr || *value == '\0')
+        {
+            return false;
+        }
+
+        errno = 0;
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 0);
+        if (errno != 0 || end == value || *end != '\0' || parsed > UINT32_MAX)
+        {
+            std::fprintf(stderr,
+                         "[guest-write-watch] ignoring invalid PS2X_TRACE_GUEST_WRITE=%s\n",
+                         value);
+            return false;
+        }
+        return true;
+    }();
+    static const uint32_t watchedAddress = [] {
+        const char *value = std::getenv("PS2X_TRACE_GUEST_WRITE");
+        return value == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(value, nullptr, 0));
+    }();
+
+    address = watchedAddress & PS2_RAM_MASK;
+    return enabled;
+}
+
+inline bool ps2GuestWriteOverlapsWatch(uint32_t guestAddr, uint32_t size, uint32_t &watchedAddress)
+{
+    if (size == 0u || !ps2GuestWriteWatchAddress(watchedAddress))
+    {
+        return false;
+    }
+
+    const uint32_t physicalAddress = guestAddr & PS2_RAM_MASK;
+    return watchedAddress >= physicalAddress &&
+           static_cast<uint64_t>(watchedAddress) < static_cast<uint64_t>(physicalAddress) + size;
+}
+
+inline bool ps2GuestReadWatchAddress(uint32_t &address)
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("PS2X_TRACE_GUEST_READ");
+        if (value == nullptr || *value == '\0')
+        {
+            return false;
+        }
+        errno = 0;
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 0);
+        if (errno != 0 || end == value || *end != '\0' || parsed > UINT32_MAX)
+        {
+            std::fprintf(stderr, "[guest-read-watch] ignoring invalid PS2X_TRACE_GUEST_READ=%s\n", value);
+            return false;
+        }
+        return true;
+    }();
+    static const uint32_t watchedAddress = [] {
+        const char *value = std::getenv("PS2X_TRACE_GUEST_READ");
+        return value == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(value, nullptr, 0));
+    }();
+    address = watchedAddress & PS2_RAM_MASK;
+    return enabled;
+}
+
+inline void ps2TraceGuestRead(const uint8_t *rdram,
+                              uint32_t guestAddr,
+                              uint32_t size,
+                              const char *op,
+                              const R5900Context *ctx)
+{
+    uint32_t watchedAddress = 0;
+    if (size == 0u || !ps2GuestReadWatchAddress(watchedAddress))
+    {
+        return;
+    }
+    const uint32_t physicalAddress = guestAddr & PS2_RAM_MASK;
+    if (watchedAddress < physicalAddress ||
+        static_cast<uint64_t>(watchedAddress) >= static_cast<uint64_t>(physicalAddress) + size)
+    {
+        return;
+    }
+    uint64_t valueLo = 0u;
+    if (rdram != nullptr)
+    {
+        const uint32_t bytes = std::min<uint32_t>(size, sizeof(valueLo));
+        for (uint32_t i = 0u; i < bytes; ++i)
+        {
+            valueLo |= static_cast<uint64_t>(rdram[(physicalAddress + i) & PS2_RAM_MASK]) << (i * 8u);
+        }
+    }
+    std::fprintf(stderr,
+                 "[guest-read-watch] pc=0x%08X ra=0x%08X op=%s addr=0x%08X size=%u watch=0x%08X value=0x%016llX\n",
+                 ctx == nullptr ? 0u : ctx->pc,
+                 ctx == nullptr ? 0u : getRegU32(ctx, 31),
+                 op == nullptr ? "unknown" : op,
+                 guestAddr, size, watchedAddress,
+                 static_cast<unsigned long long>(valueLo));
+}
+
 inline uint32_t ps2PathWatchPhysAddr()
 {
     return PS2_PATH_WATCH_ADDR & PS2_RAM_MASK;
@@ -243,13 +349,26 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const R5900Context *ctx)
 {
     (void)rdram;
-    (void)guestAddr;
-    (void)size;
-    (void)valueLo;
-    (void)valueHi;
-    (void)op;
-    (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+    uint32_t watchedAddress = 0;
+    if (ps2GuestWriteOverlapsWatch(guestAddr, size, watchedAddress))
+    {
+        std::fprintf(stderr,
+                     "[guest-write-watch] pc=0x%08X ra=0x%08X op=%s addr=0x%08X size=%u "
+                     "watch=0x%08X value_lo=0x%016llX value_hi=0x%016llX "
+                     "s0=0x%08X s1=0x%08X s3=0x%08X s5=0x%08X\n",
+                     ctx == nullptr ? 0u : ctx->pc,
+                     ctx == nullptr ? 0u : getRegU32(ctx, 31),
+                     op == nullptr ? "unknown" : op,
+                     guestAddr,
+                     size,
+                     watchedAddress,
+                     static_cast<unsigned long long>(valueLo),
+                     static_cast<unsigned long long>(valueHi),
+                     ctx == nullptr ? 0u : getRegU32(ctx, 16),
+                     ctx == nullptr ? 0u : getRegU32(ctx, 17),
+                     ctx == nullptr ? 0u : getRegU32(ctx, 19),
+                     ctx == nullptr ? 0u : getRegU32(ctx, 21));
+    }
 }
 
 inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
@@ -259,11 +378,23 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
                                     const R5900Context *ctx)
 {
     (void)rdram;
-    (void)guestAddr;
-    (void)size;
-    (void)op;
-    (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+    uint32_t watchedAddress = 0;
+    if (ps2GuestWriteOverlapsWatch(guestAddr, size, watchedAddress))
+    {
+        std::fprintf(stderr,
+                     "[guest-write-watch] pc=0x%08X ra=0x%08X op=%s addr=0x%08X size=%u "
+                     "watch=0x%08X range-write s0=0x%08X s1=0x%08X s3=0x%08X s5=0x%08X\n",
+                     ctx == nullptr ? 0u : ctx->pc,
+                     ctx == nullptr ? 0u : getRegU32(ctx, 31),
+                     op == nullptr ? "unknown" : op,
+                     guestAddr,
+                     size,
+                     watchedAddress,
+                     ctx == nullptr ? 0u : getRegU32(ctx, 16),
+                     ctx == nullptr ? 0u : getRegU32(ctx, 17),
+                     ctx == nullptr ? 0u : getRegU32(ctx, 19),
+                     ctx == nullptr ? 0u : getRegU32(ctx, 21));
+    }
 }
 
 class PS2Runtime
@@ -511,6 +642,10 @@ public:
     std::atomic<uint32_t> m_debugRa{0};
     std::atomic<uint32_t> m_debugSp{0};
     std::atomic<uint32_t> m_debugGp{0};
+    std::atomic<uint32_t> m_debugV0{0};
+    std::atomic<uint32_t> m_debugA0{0};
+    std::atomic<uint32_t> m_debugS0{0};
+    std::atomic<uint32_t> m_debugS1{0};
 
 private:
     struct LoadedModule

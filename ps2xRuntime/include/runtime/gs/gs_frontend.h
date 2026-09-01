@@ -4,8 +4,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "runtime/gs/gs_backend.h"
@@ -100,13 +103,17 @@ class GS
 {
 public:
     GS();
-    ~GS() = default;
+    ~GS();
 
     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
     void reset();
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
+    void setAsyncPacketProcessing(bool enabled);
+    void synchronizePacketProcessing();
+    void processHostWork();
+    void shutdownHostResources();
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     void uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxpos,
@@ -149,6 +156,8 @@ public:
     uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
 
 private:
+    void processGIFPacketImmediate(const uint8_t *data, uint32_t sizeBytes);
+    void packetWorkerLoop();
     void snapshotVRAM();
     void writeRegisterUnlocked(uint8_t regAddr, uint64_t value);
     void writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi);
@@ -183,6 +192,14 @@ private:
     mutable std::recursive_mutex m_stateMutex;
     mutable std::mutex m_backendLifetimeMutex;
     mutable std::mutex m_presentationMutex;
+    std::mutex m_packetMutex;
+    std::condition_variable m_packetReady;
+    std::condition_variable m_packetIdle;
+    std::deque<std::vector<uint8_t>> m_packetQueue;
+    std::thread m_packetWorker;
+    bool m_asyncPacketProcessing = false;
+    bool m_packetWorkerActive = false;
+    bool m_packetWorkerStopping = false;
 
     GSContext m_ctx[2];
     GSPrimReg m_prim{};
@@ -241,7 +258,7 @@ private:
     uint64_t m_debugLastVsyncTick = UINT64_MAX;
     bool m_debugHistoryPaused = true;
 
-    std::unique_ptr<GSRasterBackend> m_backend;
+    std::shared_ptr<GSRasterBackend> m_backend;
 };
 
 #endif

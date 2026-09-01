@@ -181,11 +181,13 @@ private:
     {
         static constexpr uint32_t kBufferSize = 0x10000u;
         std::array<uint8_t, kBufferSize> packet{};
+        uint32_t qwordAddress = 0;
         uint32_t sourceAddress = 0;
         uint32_t totalBytes = 0;
         uint32_t copiedBytes = 0;
         uint32_t currentTagEnd = 0;
         uint32_t cycleCredit = 0;
+        uint32_t issuePc = 0;
         uint64_t issueCycle = 0;
         bool active = false;
         bool currentTagEop = false;
@@ -203,6 +205,7 @@ private:
     Unit m_unit;
     VU1State m_state;
     std::array<DecodedInstructionPair, kMaxDecodedPairs> m_decodedCodeCache{};
+    DecodedInstructionPair m_decodedScratch{};
     const uint8_t *m_cachedVuCode = nullptr;
     const PS2Memory *m_cachedMemory = nullptr;
     uint32_t m_cachedCodeSize = 0;
@@ -216,6 +219,12 @@ private:
     std::array<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
     std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
     std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
+    uint8_t m_flagPipelineFreeMask = 0xFFu;
+    uint8_t m_efuFreeMask = 0x03u;
+    uint8_t m_storePipelineFreeMask = 0xFFu;
+    uint16_t m_vfWritePipelineFreeMask = 0xFFFFu;
+    uint8_t m_viWritePipelineFreeMask = 0xFFu;
+    uint8_t m_accWritePipelineFreeMask = 0xFFu;
     XgkickPipeline m_xgkick{};
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
     std::array<uint64_t, 16> m_viReady{};
@@ -250,7 +259,7 @@ private:
     static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
     static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
-    DecodedInstructionPair getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
+    const DecodedInstructionPair &getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
 
     void execUpper(uint32_t instr);
@@ -260,10 +269,10 @@ private:
     void applyDestAcc(const float *result, uint8_t dest);
     void applyFmacDest(float *dst, float *result, uint8_t dest);
     void applyFmacDestAcc(float *result, uint8_t dest);
-    void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4]);
-    bool calculateFmacExactResult(uint32_t component, long double &result) const;
+    uint32_t normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4]);
+    bool calculateFmacExactResult(uint32_t component, long double &result,
+                                  uint8_t &productFlags) const;
     uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
-    uint32_t calculateFmacProductSticky(uint8_t dest) const;
     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
     void queueFsset(uint16_t immediate);
     void queueClip(uint32_t clip);

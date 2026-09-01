@@ -15,4 +15,6 @@ namespace ps2_stubs
 #undef PS2_DECLARE_STUB
 
     void resetSifState();
+    void refreshPad2DmaBuffers(uint8_t *rdram);
+    void preparePad2DmaRead(uint8_t *rdram, uint32_t address, uint32_t size, uint32_t pc);
 }

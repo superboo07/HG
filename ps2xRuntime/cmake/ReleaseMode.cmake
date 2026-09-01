@@ -15,9 +15,8 @@ function(EnableFastReleaseMode TargetName)
                 /Gw # global data in COMDAT
                 /GF # string pooling
                 /Zc:inline # remove unreferenced inline
-                /fp:fast # fast math (graphics friendly)
+                /fp:precise # preserve guest-visible floating-point behavior
                 /DNDEBUG
-                /arch:AVX2 # Advanced Vector Extensions 2
                 /GS- # Disable Buffer Security Check (faster)
                 /Qspectre- # Disable Spectre mitigations (faster)
             >

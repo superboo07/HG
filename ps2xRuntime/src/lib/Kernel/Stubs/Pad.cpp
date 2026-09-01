@@ -56,6 +56,8 @@ namespace ps2_stubs
             uint32_t transientState = 0u;
             PadInputState lastInput{};
             uint8_t lastData[32]{};
+            uint8_t lastPad2Data[34]{};
+            bool lastPad2DataValid = false;
             uint32_t readCount = 0u;
             uint32_t lastReadDataAddr = 0u;
         };
@@ -65,6 +67,9 @@ namespace ps2_stubs
         bool g_padOverrideEnabled = false;
         PadInputState g_padOverrideState{};
         PadPortState g_padPorts[kPadPortCount]{};
+        std::atomic<uint32_t> g_pad2ReadAddr{0u};
+        std::atomic<uint32_t> g_pad2DmaReadTraceCount{0u};
+        std::atomic<uint32_t> g_pad2DmaReadTraceButtons{0xFFFFu};
         int g_padReadLogCount = 0;
 
         uint8_t axisToByte(float axis)
@@ -194,6 +199,9 @@ namespace ps2_stubs
 
         void resetPadStateLocked()
         {
+            g_pad2ReadAddr.store(0u, std::memory_order_release);
+            g_pad2DmaReadTraceCount.store(0u, std::memory_order_release);
+            g_pad2DmaReadTraceButtons.store(0xFFFFu, std::memory_order_release);
             for (PadPortState &portState : g_padPorts)
             {
                 portState = PadPortState{};
@@ -266,6 +274,72 @@ namespace ps2_stubs
             data[19] = pressureValue(state, portState, kPadBtnR2);
         }
 
+        void fillPad2Status(uint8_t *data, const uint8_t *classicData)
+        {
+            // scePad2Read receives the address of the result member, not the
+            // surrounding socket object. The active-low word is therefore at
+            // result offsets 0/1. Pressure bytes follow in digital-button bit
+            // order so the game's bit-indexed callback can consume them.
+            std::memset(data, 0, 34u);
+            data[0] = classicData[2];
+            data[1] = classicData[3];
+            data[2] = classicData[4]; // Right stick X
+            data[3] = classicData[5]; // Right stick Y
+            data[4] = classicData[6]; // Left stick X
+            data[5] = classicData[7]; // Left stick Y
+            data[2u + 4u] = classicData[10]; // Up
+            data[2u + 5u] = classicData[8];  // Right
+            data[2u + 6u] = classicData[11]; // Down
+            data[2u + 7u] = classicData[9];  // Left
+            data[2u + 8u] = classicData[17]; // L2
+            data[2u + 9u] = classicData[19]; // R2
+            data[2u + 10u] = classicData[16]; // L1
+            data[2u + 11u] = classicData[18]; // R1
+            data[2u + 12u] = classicData[12]; // Triangle
+            data[2u + 13u] = classicData[13]; // Circle
+            data[2u + 14u] = classicData[14]; // Cross
+            data[2u + 15u] = classicData[15]; // Square
+        }
+
+        uint32_t padPulseEnvValue(const char *name, uint32_t fallback)
+        {
+            const char *text = std::getenv(name);
+            if (!text || text[0] == '\0')
+            {
+                return fallback;
+            }
+            char *end = nullptr;
+            const unsigned long value = std::strtoul(text, &end, 0);
+            return end != text && *end == '\0' ? static_cast<uint32_t>(value) : fallback;
+        }
+
+        void applyDiagnosticPadPulse(PadInputState &state, uint64_t readCount)
+        {
+            const uint32_t buttonMask = padPulseEnvValue("PS2X_PAD_PULSE_BUTTONS", 0u) & 0xFFFFu;
+            if (buttonMask == 0u)
+            {
+                return;
+            }
+            const uint32_t period = std::max<uint32_t>(2u, padPulseEnvValue("PS2X_PAD_PULSE_PERIOD_READS", 120u));
+            const uint32_t width = std::clamp<uint32_t>(padPulseEnvValue("PS2X_PAD_PULSE_WIDTH_READS", 2u), 1u, period - 1u);
+            const uint64_t start = padPulseEnvValue("PS2X_PAD_PULSE_START_READS", 0u);
+            const uint64_t end = padPulseEnvValue("PS2X_PAD_PULSE_END_READS", UINT32_MAX);
+            if (readCount < start || readCount >= end)
+            {
+                return;
+            }
+            const uint64_t phase = readCount >= start ? (readCount - start) % period : period;
+            if (phase < width)
+            {
+                state.buttons &= static_cast<uint16_t>(~buttonMask);
+                if (phase == 0u)
+                {
+                    std::fprintf(stderr, "[pad] diagnostic pulse read=%llu buttons=0x%04X width=%u period=%u\n",
+                                 static_cast<unsigned long long>(readCount), buttonMask, width, period);
+                }
+            }
+        }
+
         bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr)
         {
             if (!outData)
@@ -314,6 +388,8 @@ namespace ps2_stubs
                     applyKeyboardState(state, portState.analogMode);
                 }
             }
+
+            applyDiagnosticPadPulse(state, portState.readCount);
 
             fillPadStatus(outData, state, portState);
 
@@ -798,6 +874,195 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    // libpad2 uses socket handles and reports STABLE as 1. Haunting Ground
+    // passes a null socket descriptor for port 0/slot 0. Keep its transport on
+    // the same portable sampler as classic libpad while preserving this ABI.
+    void scePad2Init(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        scePadInit(rdram, ctx, runtime);
+    }
+
+    void scePad2End(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        scePadEnd(rdram, ctx, runtime);
+    }
+
+    void scePad2CreateSocket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)runtime;
+        const uint32_t socketParamAddr = getRegU32(ctx, 4);
+        const uint32_t dmaAddr = getRegU32(ctx, 5);
+        int port = 0;
+        int slot = 0;
+        if (socketParamAddr != 0u)
+        {
+            const uint8_t *param = getMemPtr(rdram, socketParamAddr);
+            if (!param)
+            {
+                setReturnS32(ctx, -1);
+                return;
+            }
+            std::memcpy(&port, param + 4, sizeof(port));
+            std::memcpy(&slot, param + 8, sizeof(slot));
+        }
+
+        uint8_t *dma = getMemPtr(rdram, dmaAddr);
+        std::lock_guard<std::mutex> lock(g_padStateMutex);
+        PadPortState *portState = lookupPadPortStateLocked(port, slot);
+        if (!portState || (dmaAddr != 0u && !dma))
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        initializePadPortLocked(*portState, dmaAddr);
+        portState->analogMode = true;
+        portState->pressureEnabled = true;
+        if (dma)
+        {
+            ps2TraceGuestRangeWrite(rdram, dmaAddr, 128u, "scePad2CreateSocket", ctx);
+            std::memset(dma, 0, 128u);
+            dma[4] = 1u;
+            dma[28] = 0xFFu;
+            dma[29] = 0xFFu;
+        }
+        setReturnS32(ctx, port);
+    }
+
+    void scePad2DeleteSocket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        const int socket = static_cast<int>(getRegU32(ctx, 4));
+        std::lock_guard<std::mutex> lock(g_padStateMutex);
+        PadPortState *portState = lookupPadPortStateLocked(socket, 0);
+        if (!portState || !portState->open)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+        *portState = PadPortState{};
+        setReturnS32(ctx, 0);
+    }
+
+    void scePad2Read(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const int socket = static_cast<int>(getRegU32(ctx, 4));
+        const uint32_t dataAddr = getRegU32(ctx, 5);
+        uint8_t *data = getMemPtr(rdram, dataAddr);
+        uint8_t classicData[32]{};
+        if (!data || !readPadPortData(socket, 0, runtime, classicData, dataAddr))
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+        ps2TraceGuestRangeWrite(rdram, dataAddr, 34u, "scePad2Read", ctx);
+        fillPad2Status(data, classicData);
+        {
+            std::lock_guard<std::mutex> lock(g_padStateMutex);
+            if (PadPortState *portState = lookupPadPortStateLocked(socket, 0))
+            {
+                std::memcpy(portState->lastPad2Data, data, sizeof(portState->lastPad2Data));
+                portState->lastPad2DataValid = true;
+                g_pad2ReadAddr.store(dataAddr, std::memory_order_release);
+            }
+        }
+        // Haunting Ground keeps the libpad2 button/pressure capability masks
+        // immediately after this read block. Some boot paths begin polling
+        // before issuing GetButtonProfile, so make the advertised masks
+        // available at the ABI-defined location as well.
+        uint8_t *profile = getMemPtr(rdram, dataAddr + 0x100u);
+        if (profile)
+        {
+            std::memset(profile, 0xFF, 4u);
+        }
+        const uint16_t buttons = static_cast<uint16_t>(data[0] | (static_cast<uint16_t>(data[1]) << 8u));
+        if (buttons != 0xFFFFu && padPulseEnvValue("PS2X_PAD_PULSE_BUTTONS", 0u) != 0u)
+        {
+            std::fprintf(stderr, "[pad] libpad2 write addr=0x%08X buttons=0x%04X mem=0x%02X%02X\n",
+                         dataAddr, buttons, READ8(ADD32(dataAddr, 1)), READ8(ADD32(dataAddr, 0)));
+        }
+        setReturnS32(ctx, 34);
+    }
+
+    void scePad2GetButtonProfile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)runtime;
+        const int socket = static_cast<int>(getRegU32(ctx, 4));
+        const uint32_t profileAddr = getRegU32(ctx, 5);
+        uint8_t *profile = getMemPtr(rdram, profileAddr);
+        std::lock_guard<std::mutex> lock(g_padStateMutex);
+        const PadPortState *portState = lookupPadPortStateLocked(socket, 0);
+        if (!portState || !portState->open || !profile)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+        ps2TraceGuestRangeWrite(rdram, profileAddr, 0x13Au, "scePad2GetButtonProfile", ctx);
+        std::memset(profile, 0, 0x13Au);
+        // The game consumes these as supported digital-button and pressure masks.
+        std::memset(profile, 0xFF, 4u);
+        setReturnS32(ctx, 0);
+    }
+
+    void scePad2GetState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        const int socket = static_cast<int>(getRegU32(ctx, 4));
+        std::lock_guard<std::mutex> lock(g_padStateMutex);
+        const PadPortState *portState = lookupPadPortStateLocked(socket, 0);
+        setReturnS32(ctx, (portState && portState->open) ? 1 : 0);
+    }
+
+    void scePad2GetButtonInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        const int socket = static_cast<int>(getRegU32(ctx, 4));
+        std::lock_guard<std::mutex> lock(g_padStateMutex);
+        const PadPortState *portState = lookupPadPortStateLocked(socket, 0);
+        setReturnS32(ctx, (portState && portState->open) ? 1 : -1);
+    }
+
+    void scePad2InitDmaDBuff(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        setReturnS32(ctx, 0);
+    }
+
+    void scePad2LinkDriver(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        setReturnS32(ctx, 0);
+    }
+
+    void scePad2GetSide(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        const int socket = static_cast<int>(getRegU32(ctx, 4));
+        std::lock_guard<std::mutex> lock(g_padStateMutex);
+        const PadPortState *portState = lookupPadPortStateLocked(socket, 0);
+        setReturnU32(ctx, (portState && portState->open) ? portState->dmaAddr : 0u);
+    }
+
+    void scePad2CheckDma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        setReturnS32(ctx, 1);
+    }
+
+    void scePad2SetButtonOrder(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        setReturnS32(ctx, 0);
+    }
+
     PadDebugSnapshot getPadDebugSnapshot()
     {
         PadDebugSnapshot snapshot{};
@@ -841,6 +1106,66 @@ namespace ps2_stubs
             }
         }
         return snapshot;
+    }
+
+    void refreshPad2DmaBuffers(uint8_t *rdram)
+    {
+        std::lock_guard<std::mutex> lock(g_padStateMutex);
+        for (const PadPortState &portState : g_padPorts)
+        {
+            if (!portState.open || !portState.lastPad2DataValid || portState.lastReadDataAddr == 0u)
+            {
+                continue;
+            }
+            if (uint8_t *data = getMemPtr(rdram, portState.lastReadDataAddr))
+            {
+                std::memcpy(data, portState.lastPad2Data, sizeof(portState.lastPad2Data));
+            }
+        }
+    }
+
+    void preparePad2DmaRead(uint8_t *rdram, uint32_t address, uint32_t size, uint32_t pc)
+    {
+        const uint32_t dataAddr = g_pad2ReadAddr.load(std::memory_order_acquire);
+        const bool overlapsData = dataAddr != 0u && size != 0u &&
+            address + size > dataAddr && address < dataAddr + 34u;
+        const uint32_t profileAddr = dataAddr + 0x100u;
+        const bool overlapsProfile = dataAddr != 0u && size != 0u &&
+            address + size > profileAddr && address < profileAddr + 4u;
+        if (!overlapsData && !overlapsProfile)
+        {
+            return;
+        }
+        if (overlapsData)
+        {
+            refreshPad2DmaBuffers(rdram);
+        }
+        if (padPulseEnvValue("PS2X_PAD_DMA_READ_TRACE", 0u) != 0u)
+        {
+            const uint8_t *data = getMemPtr(rdram, dataAddr);
+            const uint16_t buttons = data
+                ? static_cast<uint16_t>(data[0] | (static_cast<uint16_t>(data[1]) << 8u))
+                : 0u;
+            const uint32_t previousButtons = g_pad2DmaReadTraceButtons.exchange(buttons, std::memory_order_relaxed);
+            if (buttons != previousButtons)
+            {
+                const uint32_t traceIndex = g_pad2DmaReadTraceCount.fetch_add(1u, std::memory_order_relaxed);
+                const uint32_t traceLimit = padPulseEnvValue("PS2X_PAD_DMA_READ_TRACE_LIMIT", 256u);
+                if (traceIndex < traceLimit)
+                {
+                    const uint8_t *profile = getMemPtr(rdram, profileAddr);
+                    const uint32_t profileMask = profile
+                        ? static_cast<uint32_t>(profile[0]) |
+                            (static_cast<uint32_t>(profile[1]) << 8u) |
+                            (static_cast<uint32_t>(profile[2]) << 16u) |
+                            (static_cast<uint32_t>(profile[3]) << 24u)
+                        : 0u;
+                    std::fprintf(stderr,
+                                 "[pad] dma-read transition index=%u pc=0x%08X guest=0x%08X size=%u registered=0x%08X buttons=0x%04X profile=0x%08X\n",
+                                 traceIndex, pc, address, size, dataAddr, buttons, profileMask);
+                }
+            }
+        }
     }
 
     void setPadOverrideState(uint16_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry)

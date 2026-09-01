@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <array>
 #include <mutex>
 #include <unordered_map>
 
@@ -56,6 +57,16 @@ public:
                       uint32_t function,
                       ps2x::iop::GuestBuffer send,
                       ps2x::iop::GuestBuffer receive) override;
+    bool writeSpu2(uint32_t address, const void *source, size_t size) override;
+    uint32_t submitSpu2StereoStream(uint32_t firstCursor,
+                                    uint32_t secondCursor,
+                                    uint32_t bytesPerChannel,
+                                    uint32_t firstRingBase,
+                                    uint32_t secondRingBase,
+                                    uint32_t ringBytes,
+                                    uint32_t sampleRate) override;
+    bool scheduleHostCallback(uint32_t delayMicroseconds,
+                              std::function<void()> callback) override;
 
     std::string hostPath(ps2x::iop::HostPathKind kind) const override;
     std::string translateGuestPath(std::string_view path) const override;
@@ -67,6 +78,9 @@ public:
                       size_t size,
                       size_t &bytesRead) override;
     void closeHostFile(uint64_t handle) override;
+    bool registerCdFile(std::string_view path,
+                        uint32_t lsn,
+                        uint32_t size) override;
 
     int32_t memoryCard(const ps2x::iop::MemoryCardRequest &request) override;
 
@@ -100,4 +114,7 @@ private:
     mutable std::mutex m_hostFileMutex;
     std::unordered_map<uint64_t, HostFile> m_hostFiles;
     uint64_t m_nextHostFileHandle = 1u;
+    static constexpr size_t kSpu2RamBytes = 2u * 1024u * 1024u;
+    std::mutex m_spu2Mutex;
+    std::array<uint8_t, kSpu2RamBytes> m_spu2Ram{};
 };

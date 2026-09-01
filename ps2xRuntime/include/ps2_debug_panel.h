@@ -16,7 +16,8 @@ public:
 
 private:
     bool m_initialized = false;
-    bool m_visible = true;
+    // Keep gameplay input available by default; F1 still opens the debugger.
+    bool m_visible = false;
     bool m_showRegisters = true;
     unsigned int m_memoryAddress = 0x00100000u;
     unsigned int m_memoryBytes = 0x100u;

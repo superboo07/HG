@@ -62,6 +62,16 @@ namespace
     constexpr uint32_t kTimer2WaitPc = 0x00160500u;
     constexpr uint32_t kTimer2ResumePc = 0x00160510u;
     constexpr uint32_t kTimer2HandlerPc = 0x00160520u;
+    constexpr uint32_t kIrqStackProbePc = 0x00160600u;
+    constexpr uint32_t kIrqStackProbeResumePc = 0x00160610u;
+    constexpr uint32_t kIrqStackProbeHandlerPc = 0x00160620u;
+    constexpr uint32_t kBusyVBlankPc = 0x00160700u;
+    constexpr uint32_t kSlowGsMainPc = 0x00160800u;
+    constexpr uint32_t kSlowGsResumePc = 0x00160810u;
+    constexpr uint32_t kSlowGsCallbackPc = 0x00160820u;
+    constexpr uint32_t kIrqRegisteredSp = 0x00020000u;
+    constexpr uint32_t kIrqSavedFrameAddr = kIrqRegisteredSp - 0x10u;
+    constexpr uint32_t kIrqSavedFrameValue = 0xA5C37E19u;
 
     constexpr uint32_t kTimer2Count = 0x10001000u;
     constexpr uint32_t kTimer2Mode = 0x10001010u;
@@ -83,6 +93,10 @@ namespace
     uint64_t g_vsyncTick = 0;
     uint64_t g_vsyncCsr = 0;
     std::atomic<bool> g_timer2Resumed{false};
+    std::atomic<bool> g_slowGsMainResumed{false};
+    std::chrono::steady_clock::time_point g_slowGsCallbackStarted{};
+    uint32_t g_irqStackProbeSp = 0u;
+    uint32_t g_irqStackProbeFrame = 0u;
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -180,6 +194,35 @@ namespace
     void schedulerIrqResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
     {
         g_dispatchTrace.push_back(3);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void schedulerIrqStackProbeHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        g_irqStackProbeSp = getRegU32(ctx, 29);
+        writeGuestU32(rdram, g_irqStackProbeSp - 0x10u, 0u);
+        ctx->pc = 0u;
+    }
+
+    void schedulerIrqStackProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        writeGuestU32(rdram, kIrqSavedFrameAddr, kIrqSavedFrameValue);
+        scheduler.addIrqHandler(false,
+                                7u,
+                                kIrqStackProbeHandlerPc,
+                                true,
+                                0u,
+                                0u,
+                                kIrqRegisteredSp);
+        ctx->pc = kIrqStackProbeResumePc;
+        scheduler.dispatchIrq(false, 7u);
+    }
+
+    void schedulerIrqStackProbeResume(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_irqStackProbeFrame = readGuestU32(rdram, kIrqSavedFrameAddr);
         ctx->pc = 0u;
         runtime->requestStop();
     }
@@ -291,6 +334,46 @@ namespace
         g_dispatchTrace.push_back(3);
         g_resumedResult = getRegS32(*ctx, 2);
         g_timer2Resumed.store(true, std::memory_order_release);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void schedulerBusyVBlank(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (runtime->eeScheduler().currentVSyncTick() != 0u)
+        {
+            ctx->pc = 0u;
+            runtime->requestStop();
+            return;
+        }
+        ctx->pc = kBusyVBlankPc;
+    }
+
+    void schedulerSlowGsMain(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        scheduler.setGsVSyncCallback(kSlowGsCallbackPc, 0u, 0u);
+        ctx->pc = kSlowGsResumePc;
+        scheduler.waitVSync(scheduler.currentVSyncTick());
+    }
+
+    void schedulerSlowGsCallback(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        if (g_slowGsCallbackStarted == std::chrono::steady_clock::time_point{})
+        {
+            g_slowGsCallbackStarted = std::chrono::steady_clock::now();
+        }
+        if (std::chrono::steady_clock::now() - g_slowGsCallbackStarted < std::chrono::milliseconds(25))
+        {
+            ctx->pc = kSlowGsCallbackPc;
+            return;
+        }
+        ctx->pc = 0u;
+    }
+
+    void schedulerSlowGsResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_slowGsMainResumed.store(true, std::memory_order_release);
         ctx->pc = 0u;
         runtime->requestStop();
     }
@@ -465,6 +548,97 @@ void register_ps2_runtime_interrupt_tests()
                      "the dispatcher should run wait, IRQ frame, then the resumed base context in exact order");
             t.Equals(g_lastIntcArg.load(std::memory_order_relaxed), 0xCAFEu,
                      "the IRQ frame should receive its registered argument");
+        });
+
+        tc.Run("VBlank remains host paced while guest code stays runnable", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kBusyVBlankPc, schedulerBusyVBlank);
+
+            R5900Context mainContext{};
+            mainContext.pc = kBusyVBlankPc;
+            std::atomic<bool> schedulerDone{false};
+            std::atomic<bool> schedulerThrew{false};
+            const auto started = std::chrono::steady_clock::now();
+            std::thread gameThread([&]()
+            {
+                try
+                {
+                    env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+                    env.runtime.eeScheduler().run();
+                }
+                catch (...)
+                {
+                    schedulerThrew.store(true, std::memory_order_release);
+                }
+                schedulerDone.store(true, std::memory_order_release);
+            });
+
+            const bool receivedVBlank = waitUntil([&]()
+            {
+                return env.runtime.memory().gs().vsyncTick.load(std::memory_order_acquire) != 0u;
+            }, std::chrono::milliseconds(100));
+            env.runtime.requestStop();
+            gameThread.join();
+            const auto elapsed = std::chrono::steady_clock::now() - started;
+
+            t.IsTrue(receivedVBlank,
+                     "a runnable guest must not delay a host-paced VBlank behind incomplete static cycle accounting");
+            t.IsTrue(elapsed < std::chrono::milliseconds(150),
+                     "the first runnable-guest VBlank should arrive near its 16.67 ms host deadline");
+            t.IsTrue(schedulerDone.load(std::memory_order_acquire), "scheduler should stop after the timing probe");
+            t.IsFalse(schedulerThrew.load(std::memory_order_acquire), "runnable-guest VBlank path should not throw");
+        });
+
+        tc.Run("slow GS callbacks coalesce so the resumed guest thread is not starved", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kSlowGsMainPc, schedulerSlowGsMain);
+            env.runtime.registerFunction(kSlowGsResumePc, schedulerSlowGsResume);
+            env.runtime.registerFunction(kSlowGsCallbackPc, schedulerSlowGsCallback);
+            g_slowGsMainResumed.store(false, std::memory_order_release);
+            g_slowGsCallbackStarted = {};
+
+            R5900Context mainContext{};
+            mainContext.pc = kSlowGsMainPc;
+            std::thread gameThread([&]()
+            {
+                env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+                env.runtime.eeScheduler().run();
+            });
+
+            const bool resumed = waitUntil([]()
+            {
+                return g_slowGsMainResumed.load(std::memory_order_acquire);
+            }, std::chrono::milliseconds(120));
+            env.runtime.requestStop();
+            gameThread.join();
+
+            t.IsTrue(resumed,
+                     "a callback longer than one host frame must not accumulate duplicates ahead of guest work");
+        });
+
+        tc.Run("IRQ handlers use an async stack without clobbering a suspended frame", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kIrqStackProbePc, schedulerIrqStackProbe);
+            env.runtime.registerFunction(kIrqStackProbeResumePc, schedulerIrqStackProbeResume);
+            env.runtime.registerFunction(kIrqStackProbeHandlerPc, schedulerIrqStackProbeHandler);
+
+            g_irqStackProbeSp = 0u;
+            g_irqStackProbeFrame = 0u;
+            R5900Context mainContext{};
+            mainContext.pc = kIrqStackProbePc;
+            setRegU32(mainContext, 29, kIrqRegisteredSp);
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.IsTrue(g_irqStackProbeSp != 0u,
+                     "the IRQ handler should receive a usable scheduler-owned stack");
+            t.IsTrue(g_irqStackProbeSp != kIrqRegisteredSp,
+                     "the IRQ handler must not reuse the registration-time stack pointer");
+            t.Equals(g_irqStackProbeFrame, kIrqSavedFrameValue,
+                     "the IRQ handler must not overwrite the suspended thread frame");
         });
 
         tc.Run("iSignalSema defers selection until IRQ return", [](TestCase &t)

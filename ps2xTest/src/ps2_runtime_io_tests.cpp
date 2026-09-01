@@ -2,12 +2,17 @@
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
+#include "Kernel/Stubs/CD.h"
+#include "runtime/ee_scheduler.h"
 
 #include <filesystem>
 #include <fstream>
+#include <array>
 #include <vector>
 #include <cstring>
 #include <chrono>
+#include <cstdlib>
+#include <optional>
 
 using namespace ps2_syscalls;
 
@@ -130,6 +135,43 @@ namespace
         return paths;
     }
 
+    void setEnvironmentValue(const char *name, const char *value)
+    {
+#if defined(_WIN32)
+        _putenv_s(name, value ? value : "");
+#else
+        if (value)
+        {
+            setenv(name, value, 1);
+        }
+        else
+        {
+            unsetenv(name);
+        }
+#endif
+    }
+
+    struct ScopedEnvironment
+    {
+        explicit ScopedEnvironment(const char *variable, const char *value)
+            : name(variable)
+        {
+            if (const char *current = std::getenv(name.c_str()))
+            {
+                oldValue = current;
+            }
+            setEnvironmentValue(name.c_str(), value);
+        }
+
+        ~ScopedEnvironment()
+        {
+            setEnvironmentValue(name.c_str(), oldValue ? oldValue->c_str() : nullptr);
+        }
+
+        std::string name;
+        std::optional<std::string> oldValue;
+    };
+
     struct TestContext
     {
         TempPaths paths;
@@ -152,6 +194,49 @@ void register_ps2_runtime_io_tests()
 {
     MiniTest::Case("PS2RuntimeIO", [](TestCase &tc)
     {
+        tc.Run("ELF configuration selects a portable per-game memory-card root", [](TestCase &t)
+        {
+            TempPaths paths = makeTempPaths();
+            const PS2Runtime::IoPaths oldPaths = PS2Runtime::getIoPaths();
+            const std::filesystem::path platformData = paths.base / "portable-data";
+            const std::filesystem::path elfPath = paths.base / "game" / "SLUS_210.75";
+
+            ScopedEnvironment mcOverride("PS2X_MC_ROOT", nullptr);
+#if defined(_WIN32)
+            ScopedEnvironment platformRoot("LOCALAPPDATA", platformData.string().c_str());
+#elif defined(__APPLE__)
+            const std::filesystem::path fakeHome = paths.base / "home";
+            ScopedEnvironment platformRoot("HOME", fakeHome.string().c_str());
+#else
+            ScopedEnvironment platformRoot("XDG_DATA_HOME", platformData.string().c_str());
+#endif
+
+            PS2Runtime::configureIoPathsFromElf(elfPath.string());
+            const PS2Runtime::IoPaths configured = PS2Runtime::getIoPaths();
+#if defined(__APPLE__)
+            const std::filesystem::path expected = paths.base / "home" / "Library" /
+                                                   "Application Support" / "PS2Recomp" /
+                                                   "SLUS_210.75" / "mc0";
+#else
+            const std::filesystem::path expected = platformData / "PS2Recomp" /
+                                                   "SLUS_210.75" / "mc0";
+#endif
+            t.Equals(configured.mcRoot.lexically_normal().string(),
+                     std::filesystem::absolute(expected).lexically_normal().string(),
+                     "the default save root should use platform user data and isolate the ELF identity");
+
+            const std::filesystem::path explicitRoot = paths.base / "explicit-card";
+            {
+                ScopedEnvironment explicitOverride("PS2X_MC_ROOT", explicitRoot.string().c_str());
+                PS2Runtime::configureIoPathsFromElf(elfPath.string());
+                t.Equals(PS2Runtime::getIoPaths().mcRoot.lexically_normal().string(),
+                         std::filesystem::absolute(explicitRoot).lexically_normal().string(),
+                         "PS2X_MC_ROOT should select an exact portable memory-card directory");
+            }
+
+            PS2Runtime::setIoPaths(oldPaths);
+        });
+
         tc.Run("mc0 directory creation", [](TestCase &t)
         {
             TestContext test;
@@ -344,7 +429,7 @@ void register_ps2_runtime_io_tests()
                 "mc0: directory should NOT exist under cdRoot");
         });
 
-        tc.Run("sceMc open write read and close roundtrip through sync", [](TestCase &t)
+        tc.Run("sceMc byte-stable roundtrip survives libmc cold reinit", [](TestCase &t)
         {
             TestContext test;
 
@@ -352,7 +437,12 @@ void register_ps2_runtime_io_tests()
             const uint32_t fileAddr = GUEST_STRING_AREA_START + 0x500;
             const uint32_t writeBufAddr = GUEST_BUFFER_AREA_START + 0x300;
             const uint32_t readBufAddr = GUEST_BUFFER_AREA_START + 0x500;
-            const std::string payload = "libmc roundtrip";
+            constexpr std::array<uint8_t, 16> payload = {
+                0x00u, 0x01u, 0xFEu, 0xFFu,
+                0x78u, 0x56u, 0x34u, 0x12u,
+                0x12u, 0x34u, 0x56u, 0x78u,
+                0xA5u, 0x5Au, 0x80u, 0x7Fu,
+            };
 
             writeGuestString(test.rdram.data(), dirAddr, "/SAVEDATA");
             writeGuestString(test.rdram.data(), fileAddr, "/SAVEDATA/test.bin");
@@ -408,8 +498,9 @@ void register_ps2_runtime_io_tests()
                      "sceMcRead should report the full byte count via sceMcSync");
             t.Equals(cmd, 0x05, "sceMcSync should report READ as the last command");
 
-            std::string readback(reinterpret_cast<const char *>(test.rdram.data() + readBufAddr), payload.size());
-            t.Equals(readback, payload, "sceMcRead should fill the guest buffer with the written payload");
+            t.Equals(std::memcmp(test.rdram.data() + readBufAddr, payload.data(), payload.size()),
+                     0,
+                     "sceMcRead should preserve every literal save byte");
 
             clearContext(test.ctx);
             setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
@@ -419,6 +510,40 @@ void register_ps2_runtime_io_tests()
 
             const std::filesystem::path hostPath = test.paths.mcRoot / "SAVEDATA" / "test.bin";
             t.IsTrue(std::filesystem::exists(hostPath), "sceMcOpen/sceMcWrite should create the host file under mcRoot");
+
+            std::array<uint8_t, payload.size()> hostBytes{};
+            {
+                std::ifstream input(hostPath, std::ios::binary);
+                input.read(reinterpret_cast<char *>(hostBytes.data()),
+                           static_cast<std::streamsize>(hostBytes.size()));
+            }
+            t.IsTrue(hostBytes == payload,
+                     "the portable save file should contain the exact guest byte sequence");
+
+            clearContext(test.ctx);
+            ps2_stubs::sceMcEnd(test.rdram.data(), &test.ctx, nullptr);
+            std::fill(test.rdram.begin(), test.rdram.end(), 0u);
+            writeGuestString(test.rdram.data(), fileAddr, "/SAVEDATA/test.bin");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 0u);
+            setRegU32(test.ctx, 6, fileAddr);
+            setRegU32(test.ctx, 7, PS2_FIO_O_RDONLY);
+            ps2_stubs::sceMcOpen(test.rdram.data(), &test.ctx, nullptr);
+            const int32_t coldFd = syncMc(test.rdram, &cmd);
+            t.IsTrue(coldFd > 0, "a cold libmc reinit should reopen the persisted save");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, static_cast<uint32_t>(coldFd));
+            setRegU32(test.ctx, 5, readBufAddr);
+            setRegU32(test.ctx, 6, static_cast<uint32_t>(payload.size()));
+            ps2_stubs::sceMcRead(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram, &cmd), static_cast<int32_t>(payload.size()),
+                     "a cold libmc reinit should read the complete persisted save");
+            t.Equals(std::memcmp(test.rdram.data() + readBufAddr, payload.data(), payload.size()),
+                     0,
+                     "cold-reload bytes should remain endian-stable");
         });
 
         tc.Run("sceMcGetDir includes dot entries and file metadata", [](TestCase &t)
@@ -459,6 +584,56 @@ void register_ps2_runtime_io_tests()
                      "sceMcGetDir should report the host file size");
             t.IsTrue((entries[2].attrFile & 0x0080u) != 0u,
                      "sceMcGetDir file entries should carry the closed-file attribute");
+            const uint8_t *fileEntryBytes =
+                test.rdram.data() + GUEST_MC_TABLE_ADDR + 2u * sizeof(SceMcTblGetDir);
+            constexpr std::array<uint8_t, 6> kExpectedLittleEndianFields = {
+                0x06u, 0x00u, 0x00u, 0x00u, 0x93u, 0x80u,
+            };
+            t.Equals(std::memcmp(fileEntryBytes + 16u,
+                                 kExpectedLittleEndianFields.data(),
+                                 kExpectedLittleEndianFields.size()),
+                     0,
+                     "sceMcGetDir size and attributes should use literal PS2 little-endian bytes");
+        });
+
+        tc.Run("sceMcGetDir nonpositive maxent performs no lookup", [](TestCase &t)
+        {
+            TestContext test;
+
+            const uint32_t patternAddr = GUEST_STRING_AREA_START + 0x780;
+            writeGuestString(test.rdram.data(), patternAddr, "/BASLUS-21075HG/*");
+
+            uint8_t expectedTable[sizeof(SceMcTblGetDir)];
+            std::memset(expectedTable, 0xA5, sizeof(expectedTable));
+
+            for (const int32_t maxEntries : {-1, 0})
+            {
+                std::memset(test.rdram.data() + GUEST_MC_TABLE_ADDR,
+                            0xA5,
+                            sizeof(expectedTable));
+                clearContext(test.ctx);
+                setRegU32(test.ctx, 4, 0u);
+                setRegU32(test.ctx, 5, 0u);
+                setRegU32(test.ctx, 6, patternAddr);
+                setRegU32(test.ctx, 7, 0u);
+                setRegU32(test.ctx, 8, static_cast<uint32_t>(maxEntries));
+                setRegU32(test.ctx, 9, GUEST_MC_TABLE_ADDR);
+
+                ps2_stubs::sceMcGetDir(test.rdram.data(), &test.ctx, nullptr);
+
+                int32_t cmd = 0;
+                t.Equals(syncMc(test.rdram, &cmd), 0,
+                         "nonpositive maxent should complete with zero entries");
+                t.Equals(cmd, 0x0D,
+                         "sceMcSync should report GETDIR for nonpositive maxent");
+                t.Equals(std::memcmp(test.rdram.data() + GUEST_MC_TABLE_ADDR,
+                                     expectedTable,
+                                     sizeof(expectedTable)),
+                         0,
+                         "nonpositive maxent should leave the result table untouched");
+                t.IsFalse(std::filesystem::exists(test.paths.mcRoot / "BASLUS-21075HG"),
+                          "nonpositive maxent should not create or resolve the queried path");
+            }
         });
 
         tc.Run("sceMcGetInfo reports formatted and unformatted states", [](TestCase &t)
@@ -619,6 +794,117 @@ void register_ps2_runtime_io_tests()
             t.Equals(getRegS32(&test.ctx, 2), 1, "sceCdRead should succeed when cdImage is configured");
             t.Equals(std::memcmp(test.rdram.data() + bufAddr, "cd-image", 8), 0,
                      "sceCdRead should copy sector data from the configured image");
+        });
+
+        tc.Run("sceCdRead with a runtime defers guest data and reports busy", [](TestCase &t)
+        {
+            TestContext test;
+            PS2Runtime runtime;
+            runtime.eeScheduler().bindMainContextForSyscall(test.ctx, test.rdram.data());
+
+            constexpr uint32_t kSectorSize = 2048u;
+            constexpr uint32_t kBufferAddress = GUEST_BUFFER_AREA_START + 0x1C80;
+            const std::filesystem::path imagePath = test.paths.base / "async-disc.iso";
+            {
+                std::vector<uint8_t> sector(kSectorSize, 0u);
+                const char payload[] = "deferred-cd-image";
+                std::memcpy(sector.data(), payload, sizeof(payload) - 1u);
+                std::ofstream out(imagePath, std::ios::binary);
+                out.write(reinterpret_cast<const char *>(sector.data()),
+                          static_cast<std::streamsize>(sector.size()));
+            }
+
+            PS2Runtime::IoPaths ioPaths;
+            ioPaths.elfDirectory = test.paths.cdRoot;
+            ioPaths.hostRoot = test.paths.cdRoot;
+            ioPaths.cdRoot = test.paths.cdRoot;
+            ioPaths.mcRoot = test.paths.mcRoot;
+            ioPaths.cdImage = imagePath;
+            PS2Runtime::setIoPaths(ioPaths);
+
+            clearContext(test.ctx);
+            ps2_stubs::sceCdInit(test.rdram.data(), &test.ctx, &runtime);
+            std::memset(test.rdram.data() + kBufferAddress, 0xCC, kSectorSize);
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 1u);
+            setRegU32(test.ctx, 6, kBufferAddress);
+            ps2_stubs::sceCdRead(test.rdram.data(), &test.ctx, &runtime);
+
+            t.Equals(getRegS32(&test.ctx, 2), 1,
+                     "an asynchronous disc command should be accepted");
+            t.Equals(static_cast<uint32_t>(test.rdram[kBufferAddress]), 0xCCu,
+                     "accepted asynchronous reads must not expose data before completion");
+
+            const ps2_stubs::CdDebugSnapshot pending = ps2_stubs::getCdDebugSnapshot();
+            t.IsTrue(pending.readBusy,
+                     "the accepted read should remain busy until its scheduled completion");
+            t.Equals(pending.readLbn, 0u,
+                     "the pending read should preserve its source LBN");
+            t.Equals(pending.readSectors, 1u,
+                     "the pending read should preserve its sector count");
+            t.Equals(pending.readDestination, kBufferAddress,
+                     "the pending read should preserve its guest destination");
+            t.Equals(static_cast<uint32_t>(pending.readBytes), kSectorSize,
+                     "the staged transfer should preserve the exact byte count");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 1u);
+            ps2_stubs::sceCdSync(test.rdram.data(), &test.ctx, &runtime);
+            t.Equals(getRegS32(&test.ctx, 2), 1,
+                     "nonblocking sceCdSync should report an active command");
+
+            clearContext(test.ctx);
+            ps2_stubs::sceCdInit(test.rdram.data(), &test.ctx, &runtime);
+            t.IsFalse(ps2_stubs::getCdDebugSnapshot().readBusy,
+                      "reinitializing libcdvd should cancel the staged test request");
+        });
+
+        tc.Run("sceCdRead uses an exact extracted-file disc mapping", [](TestCase &t)
+        {
+            TestContext test;
+
+            constexpr uint32_t kSectorSize = 2048u;
+            constexpr uint32_t kBaseLbn = 0x00164972u;
+            constexpr uint32_t kBufferAddress = GUEST_BUFFER_AREA_START + 0x1E80;
+            const std::filesystem::path dataPath = test.paths.cdRoot / "DATA.CVM";
+            {
+                std::vector<uint8_t> contents(kSectorSize * 2u, 0u);
+                const char payload[] = "mapped-sector";
+                std::memcpy(contents.data() + kSectorSize, payload, sizeof(payload) - 1u);
+                std::ofstream out(dataPath, std::ios::binary);
+                out.write(reinterpret_cast<const char *>(contents.data()),
+                          static_cast<std::streamsize>(contents.size()));
+            }
+
+            t.IsTrue(ps2_stubs::registerCdFileMapping("\\DATA.CVM;1",
+                                                       kBaseLbn,
+                                                       kSectorSize * 2u),
+                     "an extracted file with the verified size should accept its exact disc LSN");
+            t.IsFalse(ps2_stubs::registerCdFileMapping("\\DATA.CVM;1",
+                                                        kBaseLbn,
+                                                        kSectorSize),
+                      "a mismatched expected size must not replace an exact mapping");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, kBaseLbn + 1u);
+            setRegU32(test.ctx, 5, 1u);
+            setRegU32(test.ctx, 6, kBufferAddress);
+            ps2_stubs::sceCdRead(test.rdram.data(), &test.ctx, nullptr);
+
+            t.Equals(getRegS32(&test.ctx, 2), 1,
+                     "sceCdRead should resolve sectors through the exact extracted-file mapping");
+            t.Equals(std::memcmp(test.rdram.data() + kBufferAddress, "mapped-sector", 13), 0,
+                     "the mapped LSN offset should select the corresponding host-file sector");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, kBaseLbn + 1u);
+            setRegU32(test.ctx, 5, 2u);
+            setRegU32(test.ctx, 6, kBufferAddress);
+            ps2_stubs::sceCdRead(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(getRegS32(&test.ctx, 2), 0,
+                     "a sector request crossing the mapped file boundary must fail");
         });
     });
 }

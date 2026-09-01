@@ -128,6 +128,42 @@ namespace
             ++audioCalls;
         }
 
+        bool writeSpu2(uint32_t address, const void *source, size_t size) override
+        {
+            if ((!source && size != 0u) || !spu2WriteSucceeds ||
+                address > spu2Memory.size() || size > spu2Memory.size() - address)
+            {
+                return false;
+            }
+            if (size != 0u)
+            {
+                std::memcpy(spu2Memory.data() + address, source, size);
+            }
+            ++spu2Writes;
+            lastSpu2Address = address;
+            lastSpu2Size = size;
+            return true;
+        }
+
+        uint32_t submitSpu2StereoStream(uint32_t firstCursor,
+                                        uint32_t secondCursor,
+                                        uint32_t bytesPerChannel,
+                                        uint32_t firstRingBase,
+                                        uint32_t secondRingBase,
+                                        uint32_t ringBytes,
+                                        uint32_t sampleRate) override
+        {
+            ++spu2StreamSubmissions;
+            lastSpu2FirstCursor = firstCursor;
+            lastSpu2SecondCursor = secondCursor;
+            lastSpu2StreamBytes = bytesPerChannel;
+            lastSpu2FirstRingBase = firstRingBase;
+            lastSpu2SecondRingBase = secondRingBase;
+            lastSpu2RingBytes = ringBytes;
+            lastSpu2SampleRate = sampleRate;
+            return 0u;
+        }
+
         std::string hostPath(HostPathKind kind) const override
         {
             switch (kind)
@@ -175,6 +211,12 @@ namespace
             {
                 return false;
             }
+            const auto overriddenSize = hostFileSizes.find(open->second);
+            if (overriddenSize != hostFileSizes.end())
+            {
+                size = overriddenSize->second;
+                return true;
+            }
             size = file->second.size();
             return true;
         }
@@ -216,6 +258,14 @@ namespace
             {
                 closedHostFileHandles.push_back(handle);
             }
+        }
+
+        bool registerCdFile(std::string_view path,
+                            uint32_t lsn,
+                            uint32_t size) override
+        {
+            registeredCdFiles.emplace_back(std::string(path), lsn, size);
+            return cdFileRegistrationSucceeds;
         }
 
         int32_t memoryCard(const MemoryCardRequest &request) override
@@ -284,6 +334,19 @@ namespace
         uint32_t lastAudioFunction = 0u;
         GuestBuffer lastAudioSend{};
         GuestBuffer lastAudioReceive{};
+        std::vector<uint8_t> spu2Memory = std::vector<uint8_t>(2u * 1024u * 1024u, 0u);
+        uint32_t spu2Writes = 0u;
+        uint32_t lastSpu2Address = 0u;
+        size_t lastSpu2Size = 0u;
+        bool spu2WriteSucceeds = true;
+        uint32_t spu2StreamSubmissions = 0u;
+        uint32_t lastSpu2FirstCursor = 0u;
+        uint32_t lastSpu2SecondCursor = 0u;
+        uint32_t lastSpu2StreamBytes = 0u;
+        uint32_t lastSpu2FirstRingBase = 0u;
+        uint32_t lastSpu2SecondRingBase = 0u;
+        uint32_t lastSpu2RingBytes = 0u;
+        uint32_t lastSpu2SampleRate = 0u;
         uint32_t memoryCardCalls = 0u;
         MemoryCardRequest lastMemoryCardRequest{};
         uint32_t guestFunctionAddress = 0x2000u;
@@ -292,8 +355,17 @@ namespace
         std::vector<uint32_t> lastGuestArguments;
         std::vector<std::pair<LogLevel, std::string>> logs;
         std::unordered_map<std::string, std::vector<uint8_t>> hostFileContents;
+        std::unordered_map<std::string, uint64_t> hostFileSizes;
         std::unordered_map<uint64_t, std::string> openHostFiles;
         std::vector<uint64_t> closedHostFileHandles;
+        struct RegisteredCdFile
+        {
+            std::string path;
+            uint32_t lsn = 0u;
+            uint32_t size = 0u;
+        };
+        std::vector<RegisteredCdFile> registeredCdFiles;
+        bool cdFileRegistrationSucceeds = true;
         uint64_t nextHostFileHandle = 1u;
 
     private:
@@ -403,6 +475,610 @@ void register_ps2_iop_tests()
                      "reload should destroy services from the previous profile");
             t.IsNotNull(findService(snapshot, "SDRDRV"),
                         "Fatal Frame profile should expose SDRDRV");
+        });
+
+        tc.Run("MCSERV GetDir carries all six EE n32 arguments", [](TestCase &t)
+        {
+            struct NameParameter
+            {
+                int32_t port;
+                int32_t slot;
+                int32_t flags;
+                int32_t maxEntries;
+                uint32_t pointer;
+                char name[1024];
+            };
+            static_assert(sizeof(NameParameter) == 1044u);
+
+            FakeIopHost host;
+            ps2x::iop::IopSubsystem subsystem(host);
+            std::string error;
+            t.IsTrue(subsystem.configure({"unmatched.elf", 0x100000u, 0x12345678u}, &error),
+                     "core MCSERV should configure without a game profile");
+
+            constexpr uint32_t kSendAddress = 0x0800u;
+            constexpr uint32_t kReceiveAddress = 0x1800u;
+            constexpr uint32_t kTableAddress = 0x5000u;
+            NameParameter parameter{};
+            parameter.port = 1;
+            parameter.slot = 0;
+            parameter.flags = 3;
+            parameter.maxEntries = 7;
+            parameter.pointer = kTableAddress;
+            std::memcpy(parameter.name, "/BISLUS-21075*", 16u);
+            t.IsTrue(host.writeGuest(kSendAddress, &parameter, sizeof(parameter)),
+                     "the complete MCSERV name parameter should fit in guest memory");
+
+            ps2x::iop::RpcRequest request{};
+            request.sid = 0x80000400u;
+            request.function = 0x0Du;
+            request.send = {kSendAddress, sizeof(parameter)};
+            request.receive = {kReceiveAddress, sizeof(int32_t)};
+            const ps2x::iop::RpcResult result = subsystem.handleRpc(request);
+
+            t.IsTrue(result.handled, "MCSERV should claim GetDir");
+            t.Equals(host.memoryCardCalls, 2u,
+                     "MCSERV configure/reset and GetDir should each reach the memory-card seam");
+            t.Equals(static_cast<uint32_t>(host.lastMemoryCardRequest.operation),
+                     static_cast<uint32_t>(MemoryCardOperation::GetDir),
+                     "MCSERV should issue a real GetDir operation");
+            t.Equals(host.lastMemoryCardRequest.arguments[0], 1u, "GetDir should preserve port");
+            t.Equals(host.lastMemoryCardRequest.arguments[1], 0u, "GetDir should preserve slot");
+            t.Equals(host.lastMemoryCardRequest.arguments[2], kSendAddress + 20u,
+                     "GetDir should pass the in-packet path address");
+            t.Equals(host.lastMemoryCardRequest.arguments[3], 3u, "GetDir should preserve mode flags");
+            t.Equals(host.lastMemoryCardRequest.arguments[4], 7u, "GetDir should carry maxent in $t0");
+            t.Equals(host.lastMemoryCardRequest.arguments[5], kTableAddress,
+                     "GetDir should carry the result table pointer in $t1");
+            t.Equals(host.readWord(kReceiveAddress), 0u,
+                     "MCSERV should return the memory-card operation result");
+        });
+
+        tc.Run("Haunting Ground CD search returns the verified DATA.CVM disc record", [](TestCase &t)
+        {
+            FakeIopHost host;
+            constexpr std::string_view kGuestPath = "\\DATA.CVM;1";
+            const std::string hostPath = "translated/" + std::string(kGuestPath);
+            host.hostFileContents[hostPath] = {};
+            host.hostFileSizes[hostPath] = 0x5E018000u;
+
+            ps2x::iop::IopSubsystem subsystem(host);
+            std::string error;
+            t.IsTrue(subsystem.configure({"SLUS_210.75", 0x00100008u, 0xA295AF2Bu}, &error),
+                     "the exact Haunting Ground ELF identity should configure");
+
+            constexpr uint32_t kSendAddress = 0x0800u;
+            constexpr uint32_t kReceiveAddress = 0x0A00u;
+            constexpr uint32_t kPathOffset = 0x24u;
+            t.IsTrue(host.writeGuest(kSendAddress + kPathOffset,
+                                     kGuestPath.data(), kGuestPath.size() + 1u),
+                     "the CD search path should fit in the request block");
+
+            ps2x::iop::RpcRequest request{};
+            request.sid = 0x80000597u;
+            request.function = 0u;
+            request.send = {kSendAddress, 0x12Cu};
+            request.receive = {kReceiveAddress, sizeof(uint32_t)};
+            const ps2x::iop::RpcResult result = subsystem.handleRpc(request);
+
+            t.IsTrue(result.handled, "the game profile should claim the CD search RPC");
+            t.Equals(result.resultAddress, kReceiveAddress,
+                     "the RPC result should remain in the caller's receive buffer");
+            t.Equals(host.readWord(kReceiveAddress), 1u,
+                     "a matching extracted DATA.CVM should report success");
+            t.Equals(host.readWord(kSendAddress + 0u), 0x00164972u,
+                     "the result should expose the verified disc LSN");
+            t.Equals(host.readWord(kSendAddress + 4u), 0x5E018000u,
+                     "the result should expose the verified file size");
+
+            std::array<uint8_t, 24> payload{};
+            t.IsTrue(host.readGuest(kSendAddress + 8u, payload.data(), payload.size()),
+                     "the packed name and date should be readable");
+            constexpr std::array<uint8_t, 24> kExpectedPayload = {
+                'D', 'A', 'T', 'A', '.', 'C', 'V', 'M', ';', '1', 0u, 0u, 0u, 0u, 0u, 0u,
+                0x00u, 0x2Au, 0x25u, 0x0Au, 0x06u, 0x01u, 0xD5u, 0x07u,
+            };
+            t.IsTrue(payload == kExpectedPayload,
+                     "the packed sceCdlFILE bytes should match the oracle response");
+            t.Equals(host.closedHostFileHandles.size(), size_t{1},
+                     "host validation should not leak its file handle");
+            t.Equals(host.registeredCdFiles.size(), size_t{1},
+                     "the verified disc file should be registered for sector reads");
+            if (!host.registeredCdFiles.empty())
+            {
+                t.Equals(host.registeredCdFiles[0].path, std::string(kGuestPath),
+                         "the sector mapping should retain the requested PS2 path");
+                t.Equals(host.registeredCdFiles[0].lsn, 0x00164972u,
+                         "the sector mapping should use the verified disc LSN");
+                t.Equals(host.registeredCdFiles[0].size, 0x5E018000u,
+                         "the sector mapping should use the verified file size");
+            }
+
+            const ps2x::iop::DebugSnapshot snapshot = subsystem.debugSnapshot();
+            const ps2x::iop::DebugService *service =
+                findService(snapshot, "Haunting Ground CD search");
+            if (!service)
+            {
+                t.Fail("the CD search service should appear in the debug snapshot");
+                return;
+            }
+            t.Equals(metricValue(*service, "successful_searches"), uint64_t{1},
+                     "the successful lookup should be counted");
+        });
+
+        tc.Run("Haunting Ground CD search rejects mismatched extracted data", [](TestCase &t)
+        {
+            FakeIopHost host;
+            constexpr std::string_view kGuestPath = "\\DATA.CVM;1";
+            const std::string hostPath = "translated/" + std::string(kGuestPath);
+            host.hostFileContents[hostPath] = {};
+            host.hostFileSizes[hostPath] = 123u;
+
+            ps2x::iop::IopSubsystem subsystem(host);
+            std::string error;
+            t.IsTrue(subsystem.configure({"SLUS_210.75", 0x00100008u, 0xA295AF2Bu}, &error),
+                     "the exact Haunting Ground ELF identity should configure");
+
+            constexpr uint32_t kSendAddress = 0x0800u;
+            constexpr uint32_t kReceiveAddress = 0x0A00u;
+            t.IsTrue(host.writeGuest(kSendAddress + 0x24u,
+                                     kGuestPath.data(), kGuestPath.size() + 1u),
+                     "the CD search path should fit in the request block");
+            host.writeWord(kReceiveAddress, 0xFFFFFFFFu);
+
+            ps2x::iop::RpcRequest request{};
+            request.sid = 0x80000597u;
+            request.function = 0u;
+            request.send = {kSendAddress, 0x12Cu};
+            request.receive = {kReceiveAddress, sizeof(uint32_t)};
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "the malformed-data request should still complete deterministically");
+            t.Equals(host.readWord(kReceiveAddress), 0u,
+                     "a host file with the wrong size must not receive verified disc metadata");
+            t.Equals(host.readWord(kSendAddress), 0u,
+                     "failure must not fabricate a disc LSN");
+        });
+
+        tc.Run("Haunting Ground MODHSYN commands reach the portable audio seam", [](TestCase &t)
+        {
+            FakeIopHost host;
+            ps2x::iop::IopSubsystem subsystem(host);
+            std::string error;
+            t.IsTrue(subsystem.configure({"SLUS_210.75", 0x00100008u, 0xA295AF2Bu}, &error),
+                     "the exact Haunting Ground ELF identity should configure");
+
+            constexpr uint32_t kSendAddress = 0x0800u;
+            constexpr uint32_t kReceiveAddress = 0x0A00u;
+            host.writeWord(kSendAddress + 8u, 0x219715C0u);
+            host.writeWord(kReceiveAddress, 0xFFFFFFFFu);
+
+            ps2x::iop::RpcRequest request{};
+            request.sid = 0x77777777u;
+            request.function = 0x00040000u;
+            request.send = {kSendAddress, 32u};
+            request.receive = {kReceiveAddress, sizeof(uint32_t)};
+            const ps2x::iop::RpcResult result = subsystem.handleRpc(request);
+
+            t.IsTrue(result.handled, "the game profile should claim MODHSYN commands");
+            t.Equals(host.readWord(kReceiveAddress), 0u,
+                     "the observed MODHSYN status response should be zero");
+            t.Equals(host.audioCalls, 1u,
+                     "the command should be forwarded through the portable audio backend seam");
+            t.Equals(host.lastAudioSid, 0x77777777u,
+                     "the audio backend should retain the MODHSYN SID");
+            t.Equals(host.lastAudioFunction, 0x00040000u,
+                     "the audio backend should retain the MODHSYN function code");
+        });
+
+        tc.Run("Haunting Ground SNDDRV transfer copies staging data and reports deferred completion", [](TestCase &t)
+        {
+            FakeIopHost host;
+            ps2x::iop::IopSubsystem subsystem(host);
+            std::string error;
+            t.IsTrue(subsystem.configure({"SLUS_210.75", 0x00100008u, 0xA295AF2Bu}, &error),
+                     "the exact Haunting Ground ELF identity should configure");
+
+            constexpr uint32_t kSendAddress = 0x0800u;
+            constexpr uint32_t kReceiveAddress = 0x0A00u;
+            constexpr uint32_t kSourceAddress = 0x1000u;
+            constexpr uint32_t kSpu2Address = 0x000DAAC0u;
+            constexpr uint32_t kTransferBytes = 16u;
+            std::array<uint8_t, 32> command{};
+            const auto putLe32 = [&](size_t offset, uint32_t value)
+            {
+                command[offset + 0u] = static_cast<uint8_t>(value);
+                command[offset + 1u] = static_cast<uint8_t>(value >> 8u);
+                command[offset + 2u] = static_cast<uint8_t>(value >> 16u);
+                command[offset + 3u] = static_cast<uint8_t>(value >> 24u);
+            };
+            const auto readLe32 = [&](uint32_t address)
+            {
+                return static_cast<uint32_t>(host.memory[address + 0u]) |
+                       (static_cast<uint32_t>(host.memory[address + 1u]) << 8u) |
+                       (static_cast<uint32_t>(host.memory[address + 2u]) << 16u) |
+                       (static_cast<uint32_t>(host.memory[address + 3u]) << 24u);
+            };
+            putLe32(8u, kSourceAddress);
+            putLe32(12u, kSpu2Address);
+            putLe32(16u, kTransferBytes);
+            putLe32(20u, 1u);
+            const std::array<uint8_t, kTransferBytes> payload = {
+                0x10u, 0x21u, 0x32u, 0x43u, 0x54u, 0x65u, 0x76u, 0x87u,
+                0x98u, 0xA9u, 0xBAu, 0xCBu, 0xDCu, 0xEDu, 0xFEu, 0x0Fu,
+            };
+            t.IsTrue(host.writeGuest(kSendAddress, command.data(), command.size()),
+                     "the exact 32-byte SNDDRV command should fit in guest memory");
+            t.IsTrue(host.writeGuest(kSourceAddress, payload.data(), payload.size()),
+                     "the SNDDRV source payload should fit in staging memory");
+
+            ps2x::iop::RpcRequest request{};
+            request.sid = 0x77777778u;
+            request.function = 0x00120000u;
+            request.mode = 1u;
+            request.send = {kSendAddress, static_cast<uint32_t>(command.size())};
+            request.receive = {kReceiveAddress, sizeof(uint32_t)};
+            const ps2x::iop::RpcResult result = subsystem.handleRpc(request);
+
+            t.IsTrue(result.handled, "the exact SNDDRV transfer class should be claimed");
+            t.Equals(result.serverDispatchPolicy, ps2x::iop::ServerDispatchPolicy::Suppress,
+                     "the HLE transfer should suppress unavailable IOP guest dispatch");
+            t.Equals(result.completionDelayMicroseconds, 100u,
+                     "the live polling strategy should defer completion by 100 microseconds");
+            t.Equals(readLe32(kReceiveAddress), 0u,
+                     "a successful transfer should return an explicit little-endian zero");
+            t.Equals(host.spu2Writes, 1u, "one SPU2 transfer should be issued");
+            t.Equals(host.lastSpu2Address, kSpu2Address,
+                     "the transfer should retain the observed SPU2 destination");
+            t.Equals(host.lastSpu2Size, size_t{kTransferBytes},
+                     "the transfer should retain the observed byte count");
+            t.IsTrue(std::equal(payload.begin(), payload.end(),
+                                host.spu2Memory.begin() + kSpu2Address),
+                     "SPU2 RAM should receive the exact staging payload");
+
+            constexpr uint32_t kFullTransferBytes = 0x4000u;
+            putLe32(16u, kFullTransferBytes);
+            std::vector<uint8_t> fullPayload(kFullTransferBytes, 0x5Au);
+            t.IsTrue(host.writeGuest(kSendAddress, command.data(), command.size()),
+                     "the full-size SNDDRV command should fit in guest memory");
+            t.IsTrue(host.writeGuest(kSourceAddress, fullPayload.data(), fullPayload.size()),
+                     "the full-size SNDDRV payload should fit in guest memory");
+            const ps2x::iop::RpcResult fullTransfer = subsystem.handleRpc(request);
+            t.Equals(fullTransfer.completionDelayMicroseconds, 900u,
+                     "a 0x4000-byte SPU2 DMA should complete on the ninth 100-us poll");
+            t.Equals(host.lastSpu2Size, size_t{kFullTransferBytes},
+                     "the full-size transfer should retain its exact byte count");
+
+            putLe32(8u, 0u);
+            t.IsTrue(host.writeGuest(kSendAddress, command.data(), command.size()),
+                     "the invalid command should fit in guest memory");
+            const ps2x::iop::RpcResult invalid = subsystem.handleRpc(request);
+            t.Equals(readLe32(kReceiveAddress), 0xFFFFFFFFu,
+                     "a zero source should return the observed -1 status encoding");
+            t.Equals(invalid.completionDelayMicroseconds, 0u,
+                     "failed transfers must not schedule a false completion delay");
+            t.Equals(host.spu2Writes, 2u, "failed validation must not write SPU2 RAM");
+
+            const DebugSnapshot snapshot = subsystem.debugSnapshot();
+            const DebugService *service =
+                findService(snapshot, "Haunting Ground Capcom SNDDRV transfer");
+            if (!service)
+            {
+                t.Fail("the game-scoped SNDDRV transfer service should expose diagnostics");
+                return;
+            }
+            t.Equals(metricValue(*service, "transfer_count"), uint64_t{2},
+                     "diagnostics should count successful transfers");
+            t.Equals(metricValue(*service, "failure_count"), uint64_t{1},
+                     "diagnostics should count rejected transfers");
+        });
+
+        tc.Run("Haunting Ground SNDDRV accepts only proven mailbox generations", [](TestCase &t)
+        {
+            FakeIopHost host(0xC0000u);
+            ps2x::iop::IopSubsystem subsystem(host);
+            std::string error;
+            t.IsTrue(subsystem.configure({"SLUS_210.75", 0x00100008u, 0xA295AF2Bu}, &error),
+                     "the exact Haunting Ground ELF identity should configure");
+
+            constexpr uint32_t kMailbox = 0x2000u;
+            constexpr uint32_t kMailboxBytes = 0x880u;
+            constexpr uint32_t kSequenceOffset = 0x87Cu;
+            host.writeWord(kMailbox, 0u);
+            host.writeWord(kMailbox + kSequenceOffset, 1u);
+            subsystem.onSifTransfer({ps2x::iop::SifTransferKind::SetDma,
+                                     ps2x::iop::SifTransferPhase::AfterCopy,
+                                     kMailbox,
+                                     0x000B2780u,
+                                     kMailboxBytes});
+            t.Equals(host.readWord(kMailbox + kSequenceOffset), 2u,
+                     "the exact empty heartbeat should return the next even generation");
+
+            host.writeWord(kMailbox, 1u);
+            host.writeWord(kMailbox + kSequenceOffset, 3u);
+            subsystem.onSifTransfer({ps2x::iop::SifTransferKind::SetDma,
+                                     ps2x::iop::SifTransferPhase::AfterCopy,
+                                     kMailbox,
+                                     0x000B2780u,
+                                     kMailboxBytes});
+            t.Equals(host.readWord(kMailbox + kSequenceOffset), 3u,
+                     "an uncharacterized nonempty generation must remain pending");
+
+            constexpr uint32_t kStreamHandle = 0x01F20000u;
+            host.writeWord(kMailbox + 0x10u, 8u);
+            host.writeWord(kMailbox + 0x14u, kStreamHandle);
+            host.writeWord(kMailbox + 0x18u, 1u);
+            host.writeWord(kMailbox + 0x1Cu, 0u);
+            host.writeWord(kMailbox + kSequenceOffset, 5u);
+            subsystem.onSifTransfer({ps2x::iop::SifTransferKind::SetDma,
+                                     ps2x::iop::SifTransferPhase::AfterCopy,
+                                     kMailbox,
+                                     0x000B2780u,
+                                     kMailboxBytes});
+            t.Equals(host.readWord(kMailbox + kSequenceOffset), 6u,
+                     "the exact opcode-8 stream-start generation should complete");
+
+            host.writeWord(kMailbox + 0x10u, 5u);
+            host.writeWord(kMailbox + 0x18u, 0u);
+            host.writeWord(kMailbox + kSequenceOffset, 7u);
+            subsystem.onSifTransfer({ps2x::iop::SifTransferKind::SetDma,
+                                     ps2x::iop::SifTransferPhase::AfterCopy,
+                                     kMailbox,
+                                     0x000B2780u,
+                                     kMailboxBytes});
+            t.Equals(host.readWord(kMailbox + kSequenceOffset), 8u,
+                     "the exact opcode-5 zero-argument control generation should complete");
+
+            constexpr uint32_t kConfigurationHandle = 0x01F20040u;
+            const std::array<std::array<uint32_t, 4>, 4> configuration{{
+                {8u, kConfigurationHandle, 0u, 0u},
+                {4u, kConfigurationHandle, 0x0000BB80u, 0u},
+                {9u, kConfigurationHandle, 0u, 0xFFFFFFF1u},
+                {9u, kConfigurationHandle, 1u, 0x0000000Fu},
+            }};
+            host.writeWord(kMailbox, 4u);
+            for (uint32_t record = 0u; record < configuration.size(); ++record)
+                for (uint32_t field = 0u; field < configuration[record].size(); ++field)
+                    host.writeWord(kMailbox + 0x10u + record * 0x10u + field * 4u,
+                                   configuration[record][field]);
+            host.writeWord(kMailbox + kSequenceOffset, 9u);
+            subsystem.onSifTransfer({ps2x::iop::SifTransferKind::SetDma,
+                                     ps2x::iop::SifTransferPhase::AfterCopy,
+                                     kMailbox,
+                                     0x000B2780u,
+                                     kMailboxBytes});
+            t.Equals(host.readWord(kMailbox + kSequenceOffset), 10u,
+                     "the oracle-matched four-record configuration batch should complete");
+
+            host.writeWord(kMailbox, 2u);
+            host.writeWord(kMailbox + 0x10u, 0x100u);
+            host.writeWord(kMailbox + 0x14u, 0x01F200A0u);
+            host.writeWord(kMailbox + 0x18u, 0x00079A40u);
+            host.writeWord(kMailbox + 0x1Cu, 0x980u);
+            host.writeWord(kMailbox + 0x20u, 0x100u);
+            host.writeWord(kMailbox + 0x24u, 0x01F200E0u);
+            host.writeWord(kMailbox + 0x28u, 0x0007DB40u);
+            host.writeWord(kMailbox + 0x2Cu, 0x980u);
+            host.writeWord(kMailbox + kSequenceOffset, 11u);
+            subsystem.onSifTransfer({ps2x::iop::SifTransferKind::SetDma,
+                                     ps2x::iop::SifTransferPhase::AfterCopy,
+                                     kMailbox,
+                                     0x00070E40u,
+                                     kMailboxBytes});
+            t.Equals(host.readWord(kMailbox + kSequenceOffset), 12u,
+                     "the exact paired playback request batch should complete");
+            t.Equals(host.readWord(kMailbox), 0u,
+                     "the first playback request should return an empty prior generation");
+            t.Equals(host.spu2StreamSubmissions, 1u,
+                     "the validated playback pair should reach the portable stream seam once");
+            t.Equals(host.lastSpu2FirstCursor, 0x00079A40u,
+                     "the stream seam should retain the first-channel cursor");
+            t.Equals(host.lastSpu2SecondCursor, 0x0007DB40u,
+                     "the stream seam should retain the second-channel cursor");
+            t.Equals(host.lastSpu2StreamBytes, 0x980u,
+                     "the stream seam should retain the per-channel byte count");
+            t.Equals(host.lastSpu2FirstRingBase, 0x00079A40u,
+                     "the first request should establish the first-channel ring base");
+            t.Equals(host.lastSpu2SecondRingBase, 0x0007DB40u,
+                     "the first request should establish the second-channel ring base");
+            t.Equals(host.lastSpu2RingBytes, 0x4000u,
+                     "the stream seam should retain the oracle-proven ring length");
+            t.Equals(host.lastSpu2SampleRate, 0xBB80u,
+                     "the stream seam should retain the configured 48 kHz rate");
+
+            host.writeWord(kMailbox, 2u);
+            host.writeWord(kMailbox + 0x10u, 0x100u);
+            host.writeWord(kMailbox + 0x14u, 0x01F200A0u);
+            host.writeWord(kMailbox + 0x18u, 0x0007D640u);
+            host.writeWord(kMailbox + 0x1Cu, 0x800u);
+            host.writeWord(kMailbox + 0x20u, 0x100u);
+            host.writeWord(kMailbox + 0x24u, 0x01F200E0u);
+            host.writeWord(kMailbox + 0x28u, 0x00081740u);
+            host.writeWord(kMailbox + 0x2Cu, 0x800u);
+            host.writeWord(kMailbox + kSequenceOffset, 13u);
+            subsystem.onSifTransfer({ps2x::iop::SifTransferKind::SetDma,
+                                     ps2x::iop::SifTransferPhase::AfterCopy,
+                                     kMailbox,
+                                     0x00070E40u,
+                                     kMailboxBytes});
+            t.Equals(host.readWord(kMailbox + kSequenceOffset), 14u,
+                     "a wrapped paired playback request should complete");
+            t.Equals(host.readWord(kMailbox), 2u,
+                     "the next generation should return the prior non-wrapping callbacks");
+            t.Equals(host.readWord(kMailbox + 0x10u), 0u,
+                     "the returned record must use the callback opcode");
+            t.Equals(host.readWord(kMailbox + 0x14u), 0x003D4E00u,
+                     "the first IOP descriptor should map to its exact EE callback object");
+            t.Equals(host.readWord(kMailbox + 0x24u), 0x003D4E14u,
+                     "the second IOP descriptor should map to its exact EE callback object");
+
+            host.writeWord(kMailbox, 2u);
+            host.writeWord(kMailbox + 0x10u, 0x100u);
+            host.writeWord(kMailbox + 0x14u, 0x01F200A0u);
+            host.writeWord(kMailbox + 0x18u, 0x00079E40u);
+            host.writeWord(kMailbox + 0x1Cu, 0x4C0u);
+            host.writeWord(kMailbox + 0x20u, 0x100u);
+            host.writeWord(kMailbox + 0x24u, 0x01F200E0u);
+            host.writeWord(kMailbox + 0x28u, 0x0007DF40u);
+            host.writeWord(kMailbox + 0x2Cu, 0x4C0u);
+            host.writeWord(kMailbox + kSequenceOffset, 15u);
+            subsystem.onSifTransfer({ps2x::iop::SifTransferKind::SetDma,
+                                     ps2x::iop::SifTransferPhase::AfterCopy,
+                                     kMailbox,
+                                     0x00070E40u,
+                                     kMailboxBytes});
+            t.Equals(host.readWord(kMailbox + kSequenceOffset), 16u,
+                     "the following playback generation should complete");
+            t.Equals(host.readWord(kMailbox), 4u,
+                     "the following generation should return four wrapped callbacks");
+            t.Equals(host.readWord(kMailbox + 0x18u), 0x0007D640u,
+                     "the first callback should retain the tail cursor");
+            t.Equals(host.readWord(kMailbox + 0x1Cu), 0x400u,
+                     "the first callback should stop at the first ring boundary");
+            t.Equals(host.readWord(kMailbox + 0x28u), 0x00079A40u,
+                     "the second callback should wrap to the first ring base");
+            t.Equals(host.readWord(kMailbox + 0x38u), 0x00081740u,
+                     "the third callback should retain the second tail cursor");
+            t.Equals(host.readWord(kMailbox + 0x48u), 0x0007DB40u,
+                     "the fourth callback should wrap to the second ring base");
+            t.Equals(host.spu2StreamSubmissions, 3u,
+                     "the wrapped and following partial requests should each submit one stereo chunk");
+
+            host.writeWord(kMailbox, 0u);
+            host.writeWord(kMailbox + kSequenceOffset, 17u);
+            subsystem.onSifTransfer({ps2x::iop::SifTransferKind::SetDma,
+                                     ps2x::iop::SifTransferPhase::AfterCopy,
+                                     kMailbox,
+                                     0x00070E40u,
+                                     kMailboxBytes});
+            t.Equals(host.readWord(kMailbox + kSequenceOffset), 18u,
+                     "an empty response generation should complete normally");
+            t.Equals(host.readWord(kMailbox), 2u,
+                     "an empty response generation should release the final delayed callbacks");
+            t.Equals(host.readWord(kMailbox + 0x14u), 0x003D4E00u,
+                     "the final first-channel callback should retain its exact object");
+            t.Equals(host.readWord(kMailbox + 0x18u), 0x00079E40u,
+                     "the final first-channel callback should retain its cursor");
+            t.Equals(host.readWord(kMailbox + 0x1Cu), 0x4C0u,
+                     "the final partial-block callback should retain its 0x40-aligned byte count");
+            t.Equals(host.readWord(kMailbox + 0x24u), 0x003D4E14u,
+                     "the final second-channel callback should retain its exact object");
+
+            // The game switches to a second descriptor pair while leaving the
+            // callback objects unchanged.  Its rings have independent bases and
+            // may replace the previous pair only after all delayed callbacks drain.
+            host.writeWord(kMailbox, 2u);
+            host.writeWord(kMailbox + 0x10u, 0x100u);
+            host.writeWord(kMailbox + 0x14u, 0x01F20020u);
+            host.writeWord(kMailbox + 0x18u, 0x00071840u);
+            host.writeWord(kMailbox + 0x1Cu, 0x1300u);
+            host.writeWord(kMailbox + 0x20u, 0x100u);
+            host.writeWord(kMailbox + 0x24u, 0x01F20060u);
+            host.writeWord(kMailbox + 0x28u, 0x00075940u);
+            host.writeWord(kMailbox + 0x2Cu, 0x1300u);
+            host.writeWord(kMailbox + kSequenceOffset, 19u);
+            subsystem.onSifTransfer({ps2x::iop::SifTransferKind::SetDma,
+                                     ps2x::iop::SifTransferPhase::AfterCopy,
+                                     kMailbox,
+                                     0x00070E40u,
+                                     kMailboxBytes});
+            t.Equals(host.readWord(kMailbox + kSequenceOffset), 20u,
+                     "a drained descriptor-pair transition should establish new ring bases");
+            t.Equals(host.readWord(kMailbox), 0u,
+                     "the new descriptor pair should return an empty prior generation");
+            t.Equals(host.spu2StreamSubmissions, 4u,
+                     "the drained descriptor-pair transition should submit its audio chunk");
+            t.Equals(host.lastSpu2FirstRingBase, 0x00071840u,
+                     "the replacement pair should establish its independent first ring");
+            t.Equals(host.lastSpu2SecondRingBase, 0x00075940u,
+                     "the replacement pair should establish its independent second ring");
+
+            host.writeWord(kMailbox, 0u);
+            host.writeWord(kMailbox + kSequenceOffset, 21u);
+            subsystem.onSifTransfer({ps2x::iop::SifTransferKind::SetDma,
+                                     ps2x::iop::SifTransferPhase::AfterCopy,
+                                     kMailbox,
+                                     0x00070E40u,
+                                     kMailboxBytes});
+            t.Equals(host.readWord(kMailbox + kSequenceOffset), 22u,
+                     "the new descriptor pair's delayed callbacks should complete");
+            t.Equals(host.readWord(kMailbox), 2u,
+                     "the new descriptor pair should produce two callback records");
+            t.Equals(host.readWord(kMailbox + 0x14u), 0x003D4DD8u,
+                     "the first new ring should select its exact callback object");
+            t.Equals(host.readWord(kMailbox + 0x18u), 0x00071840u,
+                     "the first new ring callback should retain its cursor");
+            t.Equals(host.readWord(kMailbox + 0x24u), 0x003D4DECu,
+                     "the second new ring should select its exact callback object");
+            t.Equals(host.readWord(kMailbox + 0x28u), 0x00075940u,
+                     "the second new ring callback should retain its cursor");
+
+            host.writeWord(kMailbox, 2u);
+            host.writeWord(kMailbox + 0x10u, 0x100u);
+            host.writeWord(kMailbox + 0x14u, 0x01F20020u);
+            host.writeWord(kMailbox + 0x18u, 0x00079A40u);
+            host.writeWord(kMailbox + 0x1Cu, 0x980u);
+            host.writeWord(kMailbox + 0x20u, 0x100u);
+            host.writeWord(kMailbox + 0x24u, 0x01F20060u);
+            host.writeWord(kMailbox + 0x28u, 0x0007DB40u);
+            host.writeWord(kMailbox + 0x2Cu, 0x980u);
+            host.writeWord(kMailbox + kSequenceOffset, 23u);
+            subsystem.onSifTransfer({ps2x::iop::SifTransferKind::SetDma,
+                                     ps2x::iop::SifTransferPhase::AfterCopy,
+                                     kMailbox,
+                                     0x00070E40u,
+                                     kMailboxBytes});
+            t.Equals(host.readWord(kMailbox + kSequenceOffset), 23u,
+                     "the same descriptor pair must not silently rebase out-of-window cursors");
+            t.Equals(host.spu2StreamSubmissions, 4u,
+                     "a rejected out-of-window request must not reach the audio stream seam");
+
+            host.writeWord(kMailbox, 0u);
+            subsystem.onSifTransfer({ps2x::iop::SifTransferKind::SetDma,
+                                     ps2x::iop::SifTransferPhase::AfterCopy,
+                                     kMailbox,
+                                     0x000B2700u,
+                                     kMailboxBytes});
+            t.Equals(host.readWord(kMailbox + kSequenceOffset), 23u,
+                     "an unrelated IOP destination must not be acknowledged");
+
+            host.writeWord(kSequenceOffset, 1u);
+            subsystem.onSifTransfer({ps2x::iop::SifTransferKind::SetDma,
+                                     ps2x::iop::SifTransferPhase::AfterCopy,
+                                     0u,
+                                     0x00070E40u,
+                                     kMailboxBytes});
+            t.Equals(host.readWord(kSequenceOffset), 1u,
+                     "a null payload pointer must remain pending for allocation diagnosis");
+
+            const DebugSnapshot snapshot = subsystem.debugSnapshot();
+            const DebugService *service =
+                findService(snapshot, "Haunting Ground Capcom SNDDRV transfer");
+            if (!service)
+            {
+                t.Fail("the game-scoped SNDDRV transfer service should expose diagnostics");
+                return;
+            }
+            t.Equals(metricValue(*service, "empty_mailbox_acks"), uint64_t{3},
+                     "diagnostics should count exact empty-heartbeat acknowledgments");
+            t.Equals(metricValue(*service, "nonempty_mailbox_generations"), uint64_t{9},
+                     "diagnostics should expose supported and unsupported command generations");
+            t.Equals(metricValue(*service, "stream_start_commands"), uint64_t{1},
+                     "diagnostics should count the exact supported stream-start command");
+            t.Equals(metricValue(*service, "stream_control_commands"), uint64_t{1},
+                     "diagnostics should count the exact supported stream-control command");
+            t.Equals(metricValue(*service, "stream_configuration_batches"), uint64_t{1},
+                     "diagnostics should count the exact four-record configuration batch");
+            t.Equals(metricValue(*service, "playback_response_batches"), uint64_t{4},
+                     "diagnostics should count the exact paired playback response batch");
+            t.Equals(metricValue(*service, "active_stream_handle"),
+                     uint64_t{kConfigurationHandle},
+                     "the accepted configuration should retain its driver stream handle");
+            t.Equals(metricValue(*service, "last_playback_cursor"), uint64_t{0x00071840u},
+                     "diagnostics should retain the first playback cursor");
+            t.Equals(metricValue(*service, "last_playback_bytes"), uint64_t{0x1300u},
+                     "diagnostics should retain the playback byte count");
+            t.Equals(metricValue(*service, "pending_playback_callback_count"), uint64_t{0},
+                     "the empty response generation should release the delayed callback batch");
         });
 
         tc.Run("two subsystem instances isolate profile state and reset deterministically", [](TestCase &t)

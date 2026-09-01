@@ -92,6 +92,7 @@ namespace ps2x::iop
         uint32_t resultAddress = 0;
         bool signalNowaitCompletion = false;
         bool signalCompletion = false;
+        uint32_t completionDelayMicroseconds = 0;
         CallbackPolicy callbackPolicy = CallbackPolicy::RuntimeDefault;
         ServerDispatchPolicy serverDispatchPolicy = ServerDispatchPolicy::RuntimeDefault;
         uint32_t guestFunction = 0;

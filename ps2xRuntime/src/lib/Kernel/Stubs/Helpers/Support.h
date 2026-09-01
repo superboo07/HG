@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cstdlib>
 
 namespace
 {
@@ -29,8 +31,11 @@ namespace
     uint32_t g_cdStreamingEndLbn = 0xFFFFFFFFu;
     bool g_cdInitialized = false;
 
-    constexpr uint32_t kIopHeapBase = 0x04000000;
-    constexpr uint32_t kIopHeapLimit = 0x04500000;
+    // IOP heap pointers are guest-visible values and must stay in the real
+    // 2 MiB IOP address domain.  The storage remains private in SIF.cpp, so
+    // equal numeric EE addresses do not alias it.
+    constexpr uint32_t kIopHeapBase = 0x00070E00;
+    constexpr uint32_t kIopHeapLimit = 0x00200000;
     constexpr uint32_t kIopHeapAlign = 64;
     uint32_t g_iopHeapNext = kIopHeapBase;
 
@@ -327,21 +332,15 @@ namespace
         }
     }
 
-    bool registerCdFile(const std::string &ps2Path, CdFileEntry &entryOut)
+    bool resolveCdHostFile(const std::string &ps2Path,
+                           std::filesystem::path &pathOut,
+                           uint64_t &sizeBytesOut)
     {
         const std::string key = cdPathKey(ps2Path);
         if (key.empty())
         {
             g_lastCdError = -1;
             return false;
-        }
-
-        auto existing = g_cdFilesByKey.find(key);
-        if (existing != g_cdFilesByKey.end())
-        {
-            entryOut = existing->second;
-            g_lastCdError = 0;
-            return true;
         }
 
         const std::filesystem::path root = getCdRootPath();
@@ -391,6 +390,35 @@ namespace
             return false;
         }
 
+        pathOut = path;
+        sizeBytesOut = sizeBytes;
+        return true;
+    }
+
+    bool registerCdFile(const std::string &ps2Path, CdFileEntry &entryOut)
+    {
+        const std::string key = cdPathKey(ps2Path);
+        if (key.empty())
+        {
+            g_lastCdError = -1;
+            return false;
+        }
+
+        auto existing = g_cdFilesByKey.find(key);
+        if (existing != g_cdFilesByKey.end())
+        {
+            entryOut = existing->second;
+            g_lastCdError = 0;
+            return true;
+        }
+
+        std::filesystem::path path;
+        uint64_t sizeBytes = 0u;
+        if (!resolveCdHostFile(ps2Path, path, sizeBytes))
+        {
+            return false;
+        }
+
         CdFileEntry entry;
         entry.hostPath = path;
         entry.sizeBytes = static_cast<uint32_t>(std::min<uint64_t>(sizeBytes, 0xFFFFFFFFu));
@@ -400,6 +428,64 @@ namespace
         g_nextPseudoLbn += entry.sectors + 1;
         g_cdFilesByKey.emplace(key, entry);
         entryOut = entry;
+        g_lastCdError = 0;
+        return true;
+    }
+
+    bool registerCdFileAtDiscLbn(const std::string &ps2Path,
+                                 uint32_t baseLbn,
+                                 uint32_t expectedSize)
+    {
+        const std::string key = cdPathKey(ps2Path);
+        std::filesystem::path path;
+        uint64_t actualSize = 0u;
+        if (key.empty() || !resolveCdHostFile(ps2Path, path, actualSize) ||
+            actualSize != expectedSize)
+        {
+            g_lastCdError = -1;
+            return false;
+        }
+
+        const uint32_t sectors = sectorsForBytes(actualSize);
+        const uint64_t endLbn = static_cast<uint64_t>(baseLbn) + sectors;
+        if (endLbn > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 1u)
+        {
+            g_lastCdError = -1;
+            return false;
+        }
+
+        const auto existing = g_cdFilesByKey.find(key);
+        if (existing != g_cdFilesByKey.end() &&
+            existing->second.hostPath == path &&
+            existing->second.sizeBytes == expectedSize &&
+            existing->second.baseLbn == baseLbn &&
+            existing->second.sectors == sectors)
+        {
+            g_lastCdError = 0;
+            return true;
+        }
+
+        for (const auto &[otherKey, other] : g_cdFilesByKey)
+        {
+            if (otherKey == key)
+            {
+                continue;
+            }
+            const uint64_t otherStart = other.baseLbn;
+            const uint64_t otherEnd = otherStart + other.sectors;
+            if (static_cast<uint64_t>(baseLbn) < otherEnd && otherStart < endLbn)
+            {
+                g_lastCdError = -1;
+                return false;
+            }
+        }
+
+        CdFileEntry entry;
+        entry.hostPath = std::move(path);
+        entry.sizeBytes = expectedSize;
+        entry.baseLbn = baseLbn;
+        entry.sectors = sectors;
+        g_cdFilesByKey.insert_or_assign(key, std::move(entry));
         g_lastCdError = 0;
         return true;
     }
@@ -441,10 +527,16 @@ namespace
     {
         for (const auto &[key, entry] : g_cdFilesByKey)
         {
-            const uint32_t endLbn = entry.baseLbn + entry.sectors;
-            if (lbn < entry.baseLbn || lbn >= endLbn)
+            const uint64_t endLbn = static_cast<uint64_t>(entry.baseLbn) + entry.sectors;
+            const uint64_t readEndLbn = static_cast<uint64_t>(lbn) + sectors;
+            if (lbn < entry.baseLbn || static_cast<uint64_t>(lbn) >= endLbn)
             {
                 continue;
+            }
+            if (readEndLbn > endLbn)
+            {
+                g_lastCdError = -1;
+                return false;
             }
 
             const uint64_t relativeLbn = static_cast<uint64_t>(lbn - entry.baseLbn);
@@ -1360,7 +1452,12 @@ namespace
         uint32_t madr = 0;
         uint32_t qwc = 0;
         uint32_t tadr = payloadPhys;
-        uint32_t chcr = 0x00000181u; // DIR=1, TIE=1, STR=1 (normal mode).
+        PS2Memory &mem = runtime->memory();
+        const uint32_t existingChcr = mem.readIORegister(channelBase + 0x00u);
+        // The game routines preserve every existing channel-control bit except MOD,
+        // then select normal/chain mode while setting DIR and STR. In particular,
+        // VIF channels may preconfigure TTE before calling sceDmaSend.
+        uint32_t chcr = (existingChcr & 0xFFFFFFF3u) | 0x00000101u;
 
         if (preferNormalCount)
         {
@@ -1369,15 +1466,81 @@ namespace
         }
         else
         {
-            chcr = 0x00000185u; // MODE=1 chain, DIR=1, TIE=1, STR=1.
+            chcr = (existingChcr & 0xFFFFFFF3u) | 0x00000105u;
         }
 
-        PS2Memory &mem = runtime->memory();
+        if (channelBase == 0x10009000u && std::getenv("PS2X_VIF1_DMA_SUBMIT_TRACE") != nullptr)
+        {
+            static const auto traceStart = std::chrono::steady_clock::now();
+            static uint32_t traceCount = 0u;
+            double delaySeconds = 0.0;
+            if (const char *delay = std::getenv("PS2X_VIF1_DMA_SUBMIT_TRACE_DELAY_SECONDS"))
+                delaySeconds = std::strtod(delay, nullptr);
+            const double elapsedSeconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - traceStart).count();
+            if (elapsedSeconds >= delaySeconds && traceCount < 512u)
+            {
+                if (traceCount == 0u)
+                {
+                    if (const char *dumpPath = std::getenv("PS2X_VIF1_DMA_RDRAM_DUMP");
+                        dumpPath && dumpPath[0] != '\0')
+                    {
+                        std::ofstream dump(dumpPath, std::ios::binary | std::ios::trunc);
+                        if (dump)
+                        {
+                            dump.write(reinterpret_cast<const char *>(rdram), PS2_RAM_SIZE);
+                            std::cerr << "[vif1-dma-submit] dumped RDRAM to " << dumpPath << std::endl;
+                        }
+                    }
+                }
+                std::cerr << "[vif1-dma-submit] ordinal=" << traceCount
+                          << " pc=0x" << std::hex << ctx->pc
+                          << " ra=0x" << getRegU32(ctx, 31)
+                          << " chan=0x" << chanArg
+                          << " payload=0x" << payloadArg
+                          << " tadr=0x" << tadr
+                          << " count=0x" << countArg
+                          << " chcr=0x" << chcr
+                          << std::dec << " normal=" << (preferNormalCount ? 1 : 0)
+                          << std::endl;
+                ++traceCount;
+            }
+        }
+
+        static const auto dmaProfileEpoch = std::chrono::steady_clock::now();
+        static const double dmaProfileDelaySeconds = [] {
+            const char *text = std::getenv("PS2X_DMA_PROFILE_DELAY_SECONDS");
+            if (!text || text[0] == '\0')
+                return 0.0;
+            char *end = nullptr;
+            const double parsed = std::strtod(text, &end);
+            return end != text && *end == '\0' && parsed > 0.0 ? parsed : 0.0;
+        }();
+        const bool profileDma = std::getenv("PS2X_DMA_PROFILE") != nullptr &&
+                                std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - dmaProfileEpoch)
+                                        .count() >= dmaProfileDelaySeconds;
+        const auto profileStart = profileDma ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
         mem.writeIORegister(channelBase + 0x20u, qwc & 0xFFFFu);
         mem.writeIORegister(channelBase + 0x10u, madr);
         mem.writeIORegister(channelBase + 0x30u, tadr);
-        mem.writeIORegister(channelBase + 0x00u, chcr);
-        mem.processPendingTransfers();
+        const bool nativeGif = std::getenv("PS2X_DISABLE_GS_NATIVE_IMAGE_UPLOAD") == nullptr &&
+                               channelBase == 0x1000A000u && !preferNormalCount &&
+                               (mem.tryProcessNativeGifImageUploadChain(runtime->gs(), tadr, chcr) ||
+                                mem.tryProcessNativeGifPackedChain(runtime->gs(), tadr, chcr));
+        if (!nativeGif)
+        {
+            mem.writeIORegister(channelBase + 0x00u, chcr);
+        }
+        const auto submitEnd = profileDma ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
+        if (!nativeGif)
+        {
+            mem.processPendingTransfers();
+        }
+        const auto transferEnd = profileDma ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
 
         std::vector<uint32_t> completedCauses = mem.consumeCompletedDmacCauses();
         if (completedCauses.empty() && (mem.readIORegister(channelBase + 0x00u) & 0x100u) == 0u)
@@ -1434,6 +1597,27 @@ namespace
         for (const uint32_t completedCause : completedCauses)
         {
             ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, completedCause);
+        }
+
+        if (profileDma)
+        {
+            const auto profileEnd = std::chrono::steady_clock::now();
+            const double submitMilliseconds =
+                std::chrono::duration<double, std::milli>(submitEnd - profileStart).count();
+            const double drainMilliseconds =
+                std::chrono::duration<double, std::milli>(transferEnd - submitEnd).count();
+            const double handlerMilliseconds =
+                std::chrono::duration<double, std::milli>(profileEnd - transferEnd).count();
+            if (submitMilliseconds + drainMilliseconds + handlerMilliseconds >= 1.0)
+            {
+                std::cerr << "[dma-profile] channel=0x" << std::hex << channelBase << std::dec
+                          << " submit_ms=" << submitMilliseconds
+                          << " drain_ms=" << drainMilliseconds
+                          << " handlers_ms=" << handlerMilliseconds
+                          << " completions=" << completedCauses.size()
+                          << " native_gif=" << (nativeGif ? "yes" : "no")
+                          << std::endl;
+            }
         }
 
         return 0;
@@ -1807,15 +1991,18 @@ namespace
         return true;
     }
 
-    static bool writeGsDispEnv(uint8_t *rdram, uint32_t addr, uint64_t display, uint64_t dispfb)
+    static bool writeGsDispEnv(uint8_t *rdram,
+                               uint32_t addr,
+                               uint64_t pmode,
+                               uint64_t smode2,
+                               uint64_t dispfb,
+                               uint64_t display,
+                               uint64_t bgcolor)
     {
         uint8_t *ptr = getMemPtr(rdram, addr);
         if (!ptr)
             return false;
-        GsDispEnvMem env{};
-        std::memcpy(&env, ptr, sizeof(env));
-        env.dispfb = dispfb;
-        env.display = display;
+        const GsDispEnvMem env{pmode, smode2, dispfb, display, bgcolor};
         std::memcpy(ptr, &env, sizeof(env));
         return true;
     }

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ps2_stubs
@@ -24,6 +25,12 @@ namespace ps2_stubs
         bool initialized = false;
         int32_t lastError = 0;
         uint32_t mode = 0;
+        bool readBusy = false;
+        uint64_t readToken = 0;
+        uint32_t readLbn = 0;
+        uint32_t readSectors = 0;
+        uint32_t readDestination = 0;
+        size_t readBytes = 0;
         uint32_t streamingLbn = 0;
         uint32_t streamingEndLbn = 0;
         uint32_t nextPseudoLbn = 0;
@@ -40,6 +47,9 @@ namespace ps2_stubs
     };
 
     CdDebugSnapshot getCdDebugSnapshot();
+    bool registerCdFileMapping(std::string_view ps2Path,
+                               uint32_t baseLbn,
+                               uint32_t expectedSize);
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdGetError(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

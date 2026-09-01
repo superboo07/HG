@@ -357,6 +357,63 @@ namespace ps2recomp
                 return best;
             };
 
+            // A function pointer may legally name a secondary entry inside a
+            // reviewed owner range (for example, compact vtable methods that
+            // share one return tail). Treat aligned pointers from ELF data as
+            // entry evidence so those addresses receive their own generated
+            // wrappers and runtime table slots.
+            std::unordered_set<uint32_t> ownedInstructionAddresses;
+            for (const auto &[_, instructions] : decodedFunctions)
+            {
+                for (const Instruction &instruction : instructions)
+                {
+                    ownedInstructionAddresses.insert(instruction.address);
+                }
+            }
+
+            std::unordered_map<uint32_t, uint32_t> candidateDataReferences;
+            std::unordered_set<uint32_t> dataReferencedEntries;
+            for (const auto &section : sections)
+            {
+                if (section.isBSS || section.data == nullptr)
+                {
+                    continue;
+                }
+
+                const uint32_t alignedSize = section.size & ~3u;
+                for (uint32_t offset = 0; offset < alignedSize; offset += 4u)
+                {
+                    const uint32_t reference = section.address + offset;
+                    if (ownedInstructionAddresses.contains(reference))
+                    {
+                        continue;
+                    }
+                    uint32_t target = 0u;
+                    std::memcpy(&target, section.data + offset, sizeof(target));
+                    if (isExecutableAddress(target))
+                    {
+                        candidateDataReferences.emplace(reference, target);
+                    }
+                }
+            }
+            for (const auto &[reference, target] : candidateDataReferences)
+            {
+                size_t localDensity = 0u;
+                for (int32_t delta = -16; delta <= 16; delta += 4)
+                {
+                    const int64_t neighbor = static_cast<int64_t>(reference) + delta;
+                    if (neighbor >= 0 && neighbor <= std::numeric_limits<uint32_t>::max() &&
+                        candidateDataReferences.contains(static_cast<uint32_t>(neighbor)))
+                    {
+                        ++localDensity;
+                    }
+                }
+                if (localDensity >= 3u)
+                {
+                    dataReferencedEntries.insert(target);
+                }
+            }
+
             EntryDiscoveryStats stats{};
 
             while (true)
@@ -434,6 +491,14 @@ namespace ps2recomp
                     }
 
                     for (uint32_t target : analysisResult.resumeEntryPoints)
+                    {
+                        queuePendingEntry(target);
+                    }
+                }
+
+                for (uint32_t target : dataReferencedEntries)
+                {
+                    if (findContainingFunction(target) != nullptr)
                     {
                         queuePendingEntry(target);
                     }
@@ -1880,6 +1945,60 @@ namespace ps2recomp
 
                 auto &targets = m_resumeEntryTargetsByOwner[owner->start];
                 targets.push_back(target);
+            }
+        }
+
+        std::unordered_set<uint32_t> ownedInstructionAddresses;
+        for (const auto &[_, instructions] : m_decodedFunctions)
+        {
+            for (const Instruction &instruction : instructions)
+            {
+                ownedInstructionAddresses.insert(instruction.address);
+            }
+        }
+        std::unordered_map<uint32_t, uint32_t> candidateDataReferences;
+        for (const Section &section : m_sections)
+        {
+            if (section.isBSS || section.data == nullptr)
+            {
+                continue;
+            }
+            const uint32_t alignedSize = section.size & ~3u;
+            for (uint32_t offset = 0; offset < alignedSize; offset += 4u)
+            {
+                const uint32_t reference = section.address + offset;
+                if (ownedInstructionAddresses.contains(reference))
+                {
+                    continue;
+                }
+                uint32_t target = 0u;
+                std::memcpy(&target, section.data + offset, sizeof(target));
+                if ((target & 3u) == 0u && findContainingFunction(target) != nullptr)
+                {
+                    candidateDataReferences.emplace(reference, target);
+                }
+            }
+        }
+        for (const auto &[reference, target] : candidateDataReferences)
+        {
+            size_t localDensity = 0u;
+            for (int32_t delta = -16; delta <= 16; delta += 4)
+            {
+                const int64_t neighbor = static_cast<int64_t>(reference) + delta;
+                if (neighbor >= 0 && neighbor <= std::numeric_limits<uint32_t>::max() &&
+                    candidateDataReferences.contains(static_cast<uint32_t>(neighbor)))
+                {
+                    ++localDensity;
+                }
+            }
+            if (localDensity < 3u)
+            {
+                continue;
+            }
+            const Function *owner = findContainingFunction(target);
+            if (owner != nullptr && owner->start != target)
+            {
+                m_resumeEntryTargetsByOwner[owner->start].push_back(target);
             }
         }
 

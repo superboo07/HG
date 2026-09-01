@@ -231,9 +231,11 @@ namespace ps2x::iop::detail
                          uint32_t a1 = 0u,
                          uint32_t a2 = 0u,
                          uint32_t a3 = 0u,
-                         uint32_t stackArgument = 0u)
+                         uint32_t stackArgument0 = 0u,
+                         uint32_t stackArgument1 = 0u)
             {
-                return m_host.memoryCard({operation, {a0, a1, a2, a3, stackArgument}});
+                return m_host.memoryCard(
+                    {operation, {a0, a1, a2, a3, stackArgument0, stackArgument1}});
             }
 
             void writeResult(GuestBuffer receive, int32_t result)
@@ -292,9 +294,13 @@ namespace ps2x::iop::detail
                 case Operation::Delete:
                     return call(MemoryCardOperation::Delete, port, slot, nameAddress);
                 case Operation::GetDir:
-                    // MCSERV normally DMA-writes entries. The existing HLE returns
-                    // zero entries instead of fabricating directory contents.
-                    return kSucceeded;
+                    return call(MemoryCardOperation::GetDir,
+                                port,
+                                slot,
+                                nameAddress,
+                                static_cast<uint32_t>(parameter.flags),
+                                static_cast<uint32_t>(std::max(parameter.maxEntries, 0)),
+                                parameter.pointer);
                 case Operation::GetEnt:
                     return 1024;
                 default:

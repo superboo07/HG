@@ -20,10 +20,11 @@ namespace ps2_stubs
             return static_cast<uint64_t>(rgba);
         }
 
-        uint64_t makeClearXyz(int32_t x, int32_t y)
+        uint64_t makeClearXyz(int32_t x, int32_t y, uint32_t z = 0u)
         {
             return static_cast<uint64_t>(static_cast<uint16_t>(x << 4)) |
-                   (static_cast<uint64_t>(static_cast<uint16_t>(y << 4)) << 16);
+                   (static_cast<uint64_t>(static_cast<uint16_t>(y << 4)) << 16) |
+                   (static_cast<uint64_t>(z) << 32);
         }
 
         void seedGsClearPacket(GsClearMem &clear,
@@ -772,14 +773,48 @@ namespace ps2_stubs
 
     void sceGsPutDrawEnv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t envAddr = getRegU32(ctx, 4);
-        GsRegPairMem pairs[8]{};
-        if (!readGsRegPairs(rdram, envAddr, pairs, 8u))
+        const uint32_t envAddr = getRegU32(ctx, 4);
+        if (!runtime || !runtime->syncCoreSubsystems())
         {
             setReturnS32(ctx, -1);
             return;
         }
-        applyGsRegPairs(runtime, pairs, 8u);
+
+        uint32_t envOffset = 0u;
+        bool scratch = false;
+        const uint8_t *packet = getConstMemPtr(rdram, envAddr);
+        if (!packet ||
+            !ps2ResolveGuestPointer(envAddr, envOffset, scratch) ||
+            envOffset > (scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE) - sizeof(GsGiftagMem))
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        GsGiftagMem giftag{};
+        std::memcpy(&giftag, packet, sizeof(giftag));
+        const uint32_t nloop = static_cast<uint32_t>(giftag.lo & 0x7FFFu);
+        const uint32_t qwCount = nloop + 1u;
+        const uint32_t packetBytes = qwCount * 16u;
+        const uint32_t sourceSize = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+        if (packetBytes > sourceSize || envOffset > sourceSize - packetBytes)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        if (std::getenv("PS2X_TRACE_GS_SWAP") != nullptr)
+        {
+            std::cerr << "[gs:put-draw-env] env=0x" << std::hex << envAddr
+                      << " tag=0x" << giftag.lo
+                      << " regs=0x" << giftag.hi
+                      << " nloop=" << std::dec << nloop
+                      << " qwc=" << qwCount
+                      << " scratch=" << (scratch ? "yes" : "no")
+                      << std::dec << std::endl;
+        }
+
+        runtime->memory().processGIFPacket(packet, packetBytes);
         setReturnS32(ctx, 0);
     }
 
@@ -810,6 +845,13 @@ namespace ps2_stubs
 
             if (runtime)
             {
+                // PMODE and SMODE2 live in the GS privileged register bank;
+                // their numeric offsets collide with the local SCISSOR_2 and
+                // ALPHA_1 A+D addresses, so they cannot be sent through GIF.
+                auto &privRegs = runtime->memory().gs();
+                privRegs.pmode = pmode;
+                privRegs.smode2 = smode2;
+
                 uint32_t pktAddr = runtime->guestMalloc(128u, 16u);
                 if (pktAddr != 0u)
                 {
@@ -817,27 +859,23 @@ namespace ps2_stubs
                     if (pkt)
                     {
                         uint64_t *q = reinterpret_cast<uint64_t *>(pkt);
-                        q[0] = makeGiftagAplusD(7u);
+                        q[0] = makeGiftagAplusD(5u);
                         q[1] = 0xEULL;
-                        q[2] = pmode;
-                        q[3] = 0x41ULL;
-                        q[4] = smode2;
-                        q[5] = 0x42ULL;
+                        q[2] = dispfb;
+                        q[3] = 0x59ULL;
+                        q[4] = display;
+                        q[5] = 0x5aULL;
                         q[6] = dispfb;
-                        q[7] = 0x59ULL;
+                        q[7] = 0x5bULL;
                         q[8] = display;
-                        q[9] = 0x5aULL;
-                        q[10] = dispfb;
-                        q[11] = 0x5bULL;
-                        q[12] = display;
-                        q[13] = 0x5cULL;
-                        q[14] = bgcolor;
-                        q[15] = 0x5fULL;
+                        q[9] = 0x5cULL;
+                        q[10] = bgcolor;
+                        q[11] = 0x5fULL;
                         constexpr uint32_t GIF_CHANNEL = 0x1000A000;
                         constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
                         auto &mem = runtime->memory();
                         mem.writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
-                        mem.writeIORegister(GIF_CHANNEL + 0x20u, 8u);
+                        mem.writeIORegister(GIF_CHANNEL + 0x20u, 6u);
                         mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
                         mem.processPendingTransfers();
                         runtime->guestFree(pktAddr);
@@ -860,10 +898,36 @@ namespace ps2_stubs
 
     void sceGsSetDefClear(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
-        (void)ctx;
-        (void)runtime;
-        setReturnS32(ctx, 0);
+        const uint32_t clearAddr = getRegU32(ctx, 4);
+        const uint32_t ztest = getRegU32(ctx, 5);
+        const int32_t x = static_cast<int16_t>(getRegU32(ctx, 6));
+        const int32_t y = static_cast<int16_t>(getRegU32(ctx, 7));
+        const int32_t width = static_cast<int16_t>(getRegU32(ctx, 8));
+        const int32_t height = static_cast<int16_t>(getRegU32(ctx, 9));
+        const uint32_t r = getRegU32(ctx, 10) & 0xFFu;
+        const uint32_t g = getRegU32(ctx, 11) & 0xFFu;
+        const uint32_t b = readStackU32(rdram, ctx, 0u) & 0xFFu;
+        const uint32_t a = readStackU32(rdram, ctx, 8u) & 0xFFu;
+        const uint32_t z = readStackU32(rdram, ctx, 16u);
+
+        GsClearMem clear{};
+        clear.testa = {makeTest(0u), GS_REG_TEST_1};
+        clear.prim = {static_cast<uint64_t>(GS_PRIM_SPRITE), GS_REG_PRIM};
+        clear.rgbaq = {r | (g << 8u) | (b << 16u) | (a << 24u), GS_REG_RGBAQ};
+        clear.xyz2a = {makeClearXyz(x, y, z), GS_REG_XYZ2};
+        clear.xyz2b = {makeClearXyz(x + width, y + height, z), GS_REG_XYZ2};
+        clear.testb = {makeTest(ztest), GS_REG_TEST_1};
+
+        if (!writeGuestBytes(rdram,
+                             runtime,
+                             clearAddr,
+                             reinterpret_cast<const uint8_t *>(&clear),
+                             sizeof(clear)))
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+        setReturnS32(ctx, 6);
     }
 
     void sceGsSetDefDBuffDc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1012,10 +1076,18 @@ namespace ps2_stubs
             h = 448;
 
         uint32_t fbw = (w + 63) / 64;
+        const uint64_t pmode = makePmode(1u, 0u, 0u, 0u, 0u, 0x80u);
+        const uint64_t smode2 =
+            (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
+            (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
         uint64_t dispfb = makeDispFb(0, fbw, psm, 0, 0);
         uint64_t display = makeDisplay(dx, dy, 0, 0, w - 1, h - 1);
 
-        writeGsDispEnv(rdram, envAddr, display, dispfb);
+        if (!writeGsDispEnv(rdram, envAddr, pmode, smode2, dispfb, display, 0u))
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
         setReturnS32(ctx, 0);
     }
 
@@ -1141,6 +1213,24 @@ namespace ps2_stubs
         }
 
         applyGsDispEnv(runtime, db.disp[which]);
+        // Swap presents the completed display page before the SDK clear packet
+        // starts the next draw buffer. Latching from the host VSync loop can
+        // otherwise observe the single-buffered page between these operations
+        // and expose an isolated black frame.
+        runtime->gs().latchHostPresentationFrame();
+        if (std::getenv("PS2X_TRACE_GS_SWAP") != nullptr)
+        {
+            std::cerr << "[gs:swapdbuffdc] env=0x" << std::hex << envAddr
+                      << " which=" << std::dec << which
+                      << " disp=0x" << std::hex << db.disp[which].dispfb
+                      << " draw01=0x" << db.draw01.frame1.value
+                      << " draw02=0x" << db.draw02.frame2.value
+                      << " draw11=0x" << db.draw11.frame1.value
+                      << " draw12=0x" << db.draw12.frame2.value
+                      << " clear0_tag=0x" << db.giftag0.lo
+                      << " clear1_tag=0x" << db.giftag1.lo
+                      << std::dec << std::endl;
+        }
         static uint32_t s_swapDbuffLogCount = 0u;
         if (s_swapDbuffLogCount < 32u)
         {
@@ -1162,25 +1252,17 @@ namespace ps2_stubs
         }
         if (which == 0u)
         {
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw01), 8u);
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw02), 8u);
-            if (hasSeededGsClearPacket(db.clear0))
-            {
-                const uint32_t clearContext = static_cast<uint32_t>((db.clear0.prim.value >> 9) & 0x1u);
-                runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear0.rgbaq.value));
-            }
-            applyGsClearPacket(runtime, db.clear0);
+            const uint32_t nloop = static_cast<uint32_t>(db.giftag0.lo & 0x7FFFu);
+            runtime->memory().processGIFPacket(
+                reinterpret_cast<const uint8_t *>(&db.giftag0),
+                16u + nloop * 16u);
         }
         else
         {
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw11), 8u);
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw12), 8u);
-            if (hasSeededGsClearPacket(db.clear1))
-            {
-                const uint32_t clearContext = static_cast<uint32_t>((db.clear1.prim.value >> 9) & 0x1u);
-                runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear1.rgbaq.value));
-            }
-            applyGsClearPacket(runtime, db.clear1);
+            const uint32_t nloop = static_cast<uint32_t>(db.giftag1.lo & 0x7FFFu);
+            runtime->memory().processGIFPacket(
+                reinterpret_cast<const uint8_t *>(&db.giftag1),
+                16u + nloop * 16u);
         }
 
         setReturnS32(ctx, static_cast<int32_t>(which ^ 1u));
@@ -1199,13 +1281,20 @@ namespace ps2_stubs
         }
 
         applyGsDispEnv(runtime, db.disp[which]);
+        runtime->gs().latchHostPresentationFrame();
         if (which == 0u)
         {
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw0), 8u);
+            const uint32_t nloop = static_cast<uint32_t>(db.giftag0.lo & 0x7FFFu);
+            runtime->memory().processGIFPacket(
+                reinterpret_cast<const uint8_t *>(&db.giftag0),
+                16u + nloop * 16u);
         }
         else
         {
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw1), 8u);
+            const uint32_t nloop = static_cast<uint32_t>(db.giftag1.lo & 0x7FFFu);
+            runtime->memory().processGIFPacket(
+                reinterpret_cast<const uint8_t *>(&db.giftag1),
+                16u + nloop * 16u);
         }
 
         setReturnS32(ctx, static_cast<int32_t>(which ^ 1u));
@@ -1219,6 +1308,7 @@ namespace ps2_stubs
         if (mode == 0)
         {
             mem.processPendingTransfers();
+            runtime->gs().synchronizePacketProcessing();
 
             uint32_t count = 0;
             constexpr uint32_t kTimeout = 0x1000000;

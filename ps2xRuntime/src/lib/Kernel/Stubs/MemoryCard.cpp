@@ -321,6 +321,44 @@ namespace ps2_stubs
             entry.EntryName[sizeof(entry.EntryName) - 1u] = '\0';
         }
 
+        void writeMcLe16(uint8_t *destination, uint16_t value)
+        {
+            destination[0] = static_cast<uint8_t>(value);
+            destination[1] = static_cast<uint8_t>(value >> 8u);
+        }
+
+        void writeMcLe32(uint8_t *destination, uint32_t value)
+        {
+            destination[0] = static_cast<uint8_t>(value);
+            destination[1] = static_cast<uint8_t>(value >> 8u);
+            destination[2] = static_cast<uint8_t>(value >> 16u);
+            destination[3] = static_cast<uint8_t>(value >> 24u);
+        }
+
+        void encodeMcDirTableEntry(const SceMcTblGetDir &entry, uint8_t *destination)
+        {
+            std::memset(destination, 0, sizeof(SceMcTblGetDir));
+            auto writeDate = [&](size_t offset, const SceMcStDateTime &date)
+            {
+                destination[offset + 0u] = date.Resv2;
+                destination[offset + 1u] = date.Sec;
+                destination[offset + 2u] = date.Min;
+                destination[offset + 3u] = date.Hour;
+                destination[offset + 4u] = date.Day;
+                destination[offset + 5u] = date.Month;
+                writeMcLe16(destination + offset + 6u, date.Year);
+            };
+
+            writeDate(0u, entry._Create);
+            writeDate(8u, entry._Modify);
+            writeMcLe32(destination + 16u, entry.FileSizeByte);
+            writeMcLe16(destination + 20u, entry.AttrFile);
+            writeMcLe16(destination + 22u, entry.Reserve1);
+            writeMcLe32(destination + 24u, entry.Reserve2);
+            writeMcLe32(destination + 28u, entry.PdaAplNo);
+            std::memcpy(destination + 32u, entry.EntryName, sizeof(entry.EntryName));
+        }
+
         bool wildcardMatch(const std::string &pattern, const std::string &value)
         {
             size_t patternPos = 0u;
@@ -698,9 +736,25 @@ namespace ps2_stubs
     {
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
-        const std::string rawPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
         const int32_t maxEntries = static_cast<int32_t>(getRegU32(ctx, 8));
         const uint32_t tableAddr = getRegU32(ctx, 9);
+
+        // MCSERV decrements maxent before its first McGetDir call. Therefore
+        // maxent <= 0 is an accepted zero-entry command and must not inspect
+        // the path, card state, host filesystem, or result table.
+        if (maxEntries <= 0)
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_mcStateMutex);
+                setMcCommandResultLocked(kMcCmdGetDir, 0);
+            }
+            RUNTIME_LOG("[MC] GetDir port=" << port << " maxent=" << maxEntries
+                                             << " -> result=0 (no lookup)");
+            setReturnS32(ctx, 0);
+            return;
+        }
+
+        const std::string rawPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
 
         std::vector<SceMcTblGetDir> entries;
         int32_t result = kMcResultNoEntry;
@@ -822,14 +876,18 @@ namespace ps2_stubs
                         }
 
                         const size_t entryCount =
-                            std::min(entries.size(), maxEntries > 0 ? static_cast<size_t>(maxEntries) : 0u);
+                            std::min(entries.size(), static_cast<size_t>(maxEntries));
                         if (entryCount == 0u || tableAddr == 0u)
                         {
                             result = static_cast<int32_t>(entryCount);
                         }
                         else if (uint8_t *dst = getMemPtr(rdram, tableAddr))
                         {
-                            std::memcpy(dst, entries.data(), entryCount * sizeof(SceMcTblGetDir));
+                            for (size_t index = 0u; index < entryCount; ++index)
+                            {
+                                encodeMcDirTableEntry(entries[index],
+                                                      dst + index * sizeof(SceMcTblGetDir));
+                            }
                             result = static_cast<int32_t>(entryCount);
                         }
                         else

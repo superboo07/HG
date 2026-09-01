@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -49,8 +50,8 @@ namespace ps2x::iop
     struct MemoryCardRequest
     {
         MemoryCardOperation operation = MemoryCardOperation::Init;
-        // The fifth argument is carried in $t0 by the EE n32 ABI
-        std::array<uint32_t, 5> arguments{};
+        // The fifth and sixth arguments are carried in $t0/$t1 by the EE n32 ABI.
+        std::array<uint32_t, 6> arguments{};
     };
 
     class IopHost
@@ -67,6 +68,37 @@ namespace ps2x::iop
         virtual void freeGuest(uint32_t address) = 0;
 
         virtual void audioCommand(uint32_t sid, uint32_t function, GuestBuffer send, GuestBuffer receive) = 0;
+        virtual bool writeSpu2(uint32_t address, const void *source, size_t size)
+        {
+            (void)address;
+            (void)source;
+            (void)size;
+            return false;
+        }
+        virtual uint32_t submitSpu2StereoStream(uint32_t firstCursor,
+                                                uint32_t secondCursor,
+                                                uint32_t bytesPerChannel,
+                                                uint32_t firstRingBase,
+                                                uint32_t secondRingBase,
+                                                uint32_t ringBytes,
+                                                uint32_t sampleRate)
+        {
+            (void)firstCursor;
+            (void)secondCursor;
+            (void)bytesPerChannel;
+            (void)firstRingBase;
+            (void)secondRingBase;
+            (void)ringBytes;
+            (void)sampleRate;
+            return 0u;
+        }
+        virtual bool scheduleHostCallback(uint32_t delayMicroseconds,
+                                          std::function<void()> callback)
+        {
+            (void)delayMicroseconds;
+            (void)callback;
+            return false;
+        }
 
         virtual std::string hostPath(HostPathKind kind) const = 0;
         virtual std::string translateGuestPath(std::string_view path) const = 0;
@@ -78,6 +110,9 @@ namespace ps2x::iop
                                   size_t size,
                                   size_t &bytesRead) = 0;
         virtual void closeHostFile(uint64_t handle) = 0;
+        virtual bool registerCdFile(std::string_view path,
+                                    uint32_t lsn,
+                                    uint32_t size) = 0;
 
         virtual int32_t memoryCard(const MemoryCardRequest &request) = 0;
 

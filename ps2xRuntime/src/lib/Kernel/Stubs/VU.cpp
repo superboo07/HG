@@ -699,10 +699,10 @@ namespace ps2_stubs
         float m0[16]{}, m1[16]{}, out[16]{};
         if (readVuMatrix4f(rdram, m0Addr, m0) && readVuMatrix4f(rdram, m1Addr, m1))
         {
-            // out = m0 * m1 (first source . second source), matching the
-            // file's mulVuMatrix(lhs,rhs)=lhs.rhs convention and the RotMatrix
-            // / ViewScreenMatrix siblings (first operand on the left).
-            mulVuMatrix(m0, m1, out);
+            // libvu0 defines sceVu0MulMatrix(dst, m0, m1) as dst = m1 * m0.
+            // The reversed argument order is observable with non-commuting
+            // view/projection matrices and is required by the game camera.
+            mulVuMatrix(m1, m0, out);
             (void)writeVuMatrix4f(rdram, dstAddr, out);
         }
         setReturnS32(ctx, 0);
@@ -732,15 +732,16 @@ namespace ps2_stubs
         float src[4]{}, out[4]{};
         if (readVuVec4f(rdram, srcAddr, src))
         {
-            const float len = std::sqrt((src[0] * src[0]) + (src[1] * src[1]) + (src[2] * src[2]) + (src[3] * src[3]));
+            const float len = std::sqrt((src[0] * src[0]) + (src[1] * src[1]) + (src[2] * src[2]));
             if (len > 1.0e-6f)
             {
                 const float invLen = 1.0f / len;
-                for (int i = 0; i < 4; ++i)
+                for (int i = 0; i < 3; ++i)
                 {
                     out[i] = src[i] * invLen;
                 }
             }
+            out[3] = 0.0f;
             (void)writeVuVec4f(rdram, dstAddr, out);
         }
         setReturnS32(ctx, 0);
