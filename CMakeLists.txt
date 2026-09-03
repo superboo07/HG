@@ -7,6 +7,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Optional compiler cache, mirroring the pinned PS2Recomp tree so both halves of
+# the pipeline share one cache. The Visual Studio generator ignores compiler
+# launchers, so it is skipped there rather than silently doing nothing.
+option(HG_ENABLE_CCACHE "Use ccache for compilation when it is available" ON)
+if(HG_ENABLE_CCACHE AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
+    find_program(HG_CCACHE_PROGRAM NAMES ccache sccache)
+    if(HG_CCACHE_PROGRAM AND NOT CMAKE_GENERATOR MATCHES "Visual Studio")
+        set(CMAKE_C_COMPILER_LAUNCHER "${HG_CCACHE_PROGRAM}")
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${HG_CCACHE_PROGRAM}")
+        message(STATUS "Using compiler cache: ${HG_CCACHE_PROGRAM}")
+    endif()
+endif()
+
 option(HG_BUILD_RUNNER "Build the native Haunting Ground runner" ON)
 
 include(CTest)
@@ -34,10 +47,15 @@ endif()
 
 find_package(Python3 3.11 COMPONENTS Interpreter)
 if(BUILD_TESTING AND Python3_Interpreter_FOUND)
+    # unittest discover only puts the start directory on sys.path, so the tests
+    # cannot "import tools" unless the repository root is the working directory.
     add_test(
         NAME function_config_tests
         COMMAND "${Python3_EXECUTABLE}" -m unittest discover
                 -s "${CMAKE_SOURCE_DIR}/tests" -p "test_*.py" -v
+    )
+    set_tests_properties(function_config_tests PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     )
 endif()
 

@@ -31,3 +31,39 @@ jobs:
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
 
+  # The matrix above builds only the portable skeleton, so a portability break
+  # inside the pinned runtime (for example x86 SIMD intrinsics that MSVC accepts
+  # unconditionally but GCC/Clang reject without an explicit -msse4.1) reached
+  # nobody until a developer built the runtime by hand. Compile the pinned
+  # runtime and its test binary on Linux to close that gap.
+  #
+  # This job deliberately builds without running ps2x_tests: the game-scoped
+  # suites need the generated recompilation of a user-supplied ELF, which CI
+  # neither has nor may have.
+  ps2recomp-runtime-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install runtime build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build \
+            libgl1-mesa-dev \
+            libasound2-dev \
+            libx11-dev libxrandr-dev libxi-dev \
+            libxcursor-dev libxinerama-dev libxkbcommon-dev \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libswresample-dev libswscale-dev
+      - name: Configure pinned runtime
+        run: |
+          cmake -S third_party/PS2Recomp -B build/ci-runtime \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DPS2X_BUILD_STUDIO=OFF
+      - name: Build pinned runtime, tools and test binary
+        run: |
+          cmake --build build/ci-runtime \
+            --target ps2_runtime ps2_recomp ps2_analyzer ps2x_tests

@@ -42,8 +42,14 @@ compile_commands.json
 
 # Editors and operating systems
 .vs/
-.vscode/
 .idea/
+
+# Shared VS Code workspace configuration is committed; per-user overrides
+# (settings.json, *.local.json) stay local.
+.vscode/*
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
 .DS_Store
 Thumbs.db
 

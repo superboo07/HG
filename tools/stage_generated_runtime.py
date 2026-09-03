@@ -18,6 +18,70 @@ GENERATED_HEADERS = ("ps2_recompiled_functions.h", "ps2_recompiled_stubs.h")
 HG_IOP_PROFILE = Path("src/iop/haunting_ground_iop_profile.cpp")
 VERSIONED_GENERATED_DIRECTORY = re.compile(r"^recompiled-v([0-9]+)$")
 
+# Staged paths that must survive a pinned-source sync because they are produced
+# by this tool or by the recompiler rather than by the pinned checkout.
+PROTECTED_STAGED_DIRECTORIES = ("ps2xRuntime/src/runner",)
+PROTECTED_STAGED_FILES = (
+    "ps2xRuntime/include/ps2_recompiled_functions.h",
+    "ps2xRuntime/include/ps2_recompiled_stubs.h",
+    "ps2xIOP/src/haunting_ground_iop_profile.cpp",
+)
+
+
+def is_protected_staged_path(relative_posix: str) -> bool:
+    if relative_posix in PROTECTED_STAGED_FILES:
+        return True
+    return any(
+        relative_posix.startswith(f"{directory}/")
+        for directory in PROTECTED_STAGED_DIRECTORIES
+    )
+
+
+def sync_pinned_sources(ps2recomp: Path, runtime_source: Path) -> tuple[int, int]:
+    """Content-sync authored pinned sources into an existing staged copy.
+
+    Incremental staging previously refreshed only generated code, so authored
+    runtime, IOP and CMake corrections in the canonical checkout silently never
+    reached a staged build. Copy every pinned file whose content differs, then
+    remove staged leftovers that no longer exist upstream. Pruning is confined
+    to the pinned tree's own top-level directories so runtime artifacts created
+    beside them (mc0, imgui.ini, logs) are never deletion candidates.
+    """
+    canonical_top_level = {
+        entry.name for entry in ps2recomp.iterdir() if entry.name != ".git"
+    }
+
+    canonical_relative: set[str] = set()
+    synced = 0
+    for source in sorted(ps2recomp.rglob("*")):
+        relative = source.relative_to(ps2recomp)
+        if ".git" in relative.parts:
+            continue
+        if not source.is_file():
+            continue
+        relative_posix = relative.as_posix()
+        if is_protected_staged_path(relative_posix):
+            continue
+        canonical_relative.add(relative_posix)
+        destination = runtime_source / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if copy_if_changed(source, destination):
+            synced += 1
+
+    removed = 0
+    for staged in sorted(runtime_source.rglob("*")):
+        if not staged.is_file():
+            continue
+        relative_posix = staged.relative_to(runtime_source).as_posix()
+        if is_protected_staged_path(relative_posix):
+            continue
+        if relative_posix.split("/", 1)[0] not in canonical_top_level:
+            continue
+        if relative_posix not in canonical_relative:
+            staged.unlink()
+            removed += 1
+    return synced, removed
+
 
 def copy_if_changed(source: Path, destination: Path) -> bool:
     if destination.is_file() and source.read_bytes() == destination.read_bytes():
@@ -132,8 +196,14 @@ def stage(
         raise StageError(f"runtime source copy must be below {workspace_build}")
     if runtime_source.exists() and not incremental:
         shutil.rmtree(runtime_source)
+    synced = 0
+    removed = 0
     if not runtime_source.exists():
         shutil.copytree(ps2recomp, runtime_source, ignore=shutil.ignore_patterns(".git"))
+    else:
+        # Must run before the profile installation below re-applies this tool's
+        # own insertions to the refreshed pinned sources.
+        synced, removed = sync_pinned_sources(ps2recomp, runtime_source)
     install_hg_iop_profile(Path.cwd().resolve(), runtime_source)
 
     runtime = runtime_source / "ps2xRuntime"
@@ -171,7 +241,7 @@ def stage(
     include = runtime / "include"
     for header in GENERATED_HEADERS:
         copy_if_changed(generated / header, include / header)
-    return source_count, source_bytes
+    return source_count, source_bytes, synced, removed
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -188,7 +258,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        count, size = stage(args.generated, args.ps2recomp, args.runtime_source, args.incremental)
+        count, size, synced, removed = stage(
+            args.generated, args.ps2recomp, args.runtime_source, args.incremental
+        )
         removed_count = 0
         removed_bytes = 0
         if args.retain_generated_versions is not None:
@@ -199,6 +271,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(f"staged {count} generated C++ files ({size} bytes) into {args.runtime_source}")
+    if args.incremental:
+        print(f"synced {synced} pinned source files; removed {removed} stale file(s)")
     if args.retain_generated_versions is not None:
         print(
             f"pruned {removed_count} old generated version directories "

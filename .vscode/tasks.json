@@ -1,0 +1,206 @@
+{
+  // Reproducible pipeline: validate owned input -> merge manual function
+  // metadata -> recompile -> stage -> build native runner -> test.
+  // Build-directory names carry a host suffix so the three Tier 1 hosts can
+  // coexist in one checkout; see docs/FUNCTION_CONFIG.md for the CLI forms.
+  "version": "2.0.0",
+  "options": {
+    "cwd": "${workspaceFolder}"
+  },
+  "presentation": {
+    "echo": true,
+    "reveal": "always",
+    "panel": "dedicated",
+    "showReuseMessage": false
+  },
+  "tasks": [
+    {
+      "label": "cmake: configure (host preset)",
+      "type": "process",
+      "command": "cmake",
+      "args": ["--preset", "linux-ninja"],
+      "windows": { "args": ["--preset", "windows-msvc"] },
+      "osx": { "args": ["--preset", "macos-ninja"] },
+      "problemMatcher": ["$gcc"],
+      "detail": "Configure the top-level project for this host."
+    },
+    {
+      "label": "cmake: build skeleton runner",
+      "type": "process",
+      "command": "cmake",
+      "args": ["--build", "--preset", "linux-ninja"],
+      "windows": { "args": ["--build", "--preset", "windows-msvc"] },
+      "osx": { "args": ["--build", "--preset", "macos-ninja"] },
+      "dependsOn": ["cmake: configure (host preset)"],
+      "problemMatcher": ["$gcc"],
+      "detail": "Build hg_runner, the portable window/OpenGL skeleton."
+    },
+    {
+      "label": "cmake: run tests",
+      "type": "process",
+      "command": "ctest",
+      "args": ["--preset", "linux-ninja"],
+      "windows": { "args": ["--preset", "windows-msvc"] },
+      "osx": { "args": ["--preset", "macos-ninja"] },
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": [],
+      "detail": "Run the CTest suite (skeleton smoke test plus the Python tool tests)."
+    },
+    {
+      "label": "tools: build PS2Recomp analyzer and recompiler",
+      "type": "process",
+      "command": "cmake",
+      "args": ["--build", "build/linux-ninja", "--target", "hg_ps2recomp_tools"],
+      "windows": {
+        "args": ["--build", "build/windows-msvc", "--config", "Debug", "--target", "hg_ps2recomp_tools"]
+      },
+      "osx": { "args": ["--build", "build/macos-ninja", "--target", "hg_ps2recomp_tools"] },
+      "problemMatcher": ["$gcc"],
+      "detail": "Build the pinned ps2_recomp and ps2_analyzer executables."
+    },
+    {
+      "label": "pipeline: 1 merge function config",
+      "type": "process",
+      "command": "python3",
+      "windows": { "command": "python" },
+      "args": [
+        "tools/merge_function_config.py",
+        "--elf", "Haunting Ground (USA)/SLUS_210.75",
+        "--analysis-map", "config/functions.analysis.csv",
+        "--analysis-source", "standalone_analysis",
+        "--base-config", "config/recomp.base.toml"
+      ],
+      "problemMatcher": [],
+      "detail": "Verify the ELF build identity and write the effective map/config into build/generated."
+    },
+    {
+      "label": "pipeline: 2 report function coverage",
+      "type": "process",
+      "command": "python3",
+      "windows": { "command": "python" },
+      "args": [
+        "tools/report_function_coverage.py",
+        "--elf", "Haunting Ground (USA)/SLUS_210.75",
+        "--map", "build/generated/functions.effective.csv",
+        "--config", "build/generated/recomp.effective.toml",
+        "--json-out", "build/analysis/function-coverage.json"
+      ],
+      "problemMatcher": [],
+      "detail": "Audit coverage, gaps and overlaps. A nonzero exit means overlapping ranges."
+    },
+    {
+      "label": "pipeline: 3 recompile game",
+      "type": "process",
+      "command": "${workspaceFolder}/build/linux-ninja/ps2recomp/ps2xRecomp/ps2_recomp",
+      "windows": {
+        "command": "${workspaceFolder}/build/windows-msvc/ps2recomp/ps2xRecomp/Debug/ps2_recomp.exe"
+      },
+      "osx": {
+        "command": "${workspaceFolder}/build/macos-ninja/ps2recomp/ps2xRecomp/ps2_recomp"
+      },
+      "args": ["build/generated/recomp.effective.toml"],
+      "dependsOn": ["pipeline: 1 merge function config"],
+      "problemMatcher": [],
+      "detail": "Statically recompile the guest ELF into build/generated/recompiled."
+    },
+    {
+      "label": "pipeline: 4 stage generated runtime",
+      "type": "process",
+      "command": "python3",
+      "args": [
+        "tools/stage_generated_runtime.py",
+        "--generated", "build/generated/recompiled",
+        "--ps2recomp", "third_party/PS2Recomp",
+        "--runtime-source", "build/runtime-source-linux",
+        "--incremental"
+      ],
+      "windows": {
+        "command": "python",
+        "args": [
+          "tools/stage_generated_runtime.py",
+          "--generated", "build/generated/recompiled",
+          "--ps2recomp", "third_party/PS2Recomp",
+          "--runtime-source", "build/runtime-source-windows",
+          "--incremental"
+        ]
+      },
+      "osx": {
+        "args": [
+          "tools/stage_generated_runtime.py",
+          "--generated", "build/generated/recompiled",
+          "--ps2recomp", "third_party/PS2Recomp",
+          "--runtime-source", "build/runtime-source-macos",
+          "--incremental"
+        ]
+      },
+      "problemMatcher": [],
+      "detail": "Content-sync the pinned runtime plus generated code into a disposable source copy."
+    },
+    {
+      "label": "pipeline: 5 configure runner",
+      "type": "process",
+      "command": "cmake",
+      "args": [
+        "-S", "build/runtime-source-linux",
+        "-B", "build/runner-linux",
+        "-G", "Ninja",
+        "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+        "-DPS2X_BUILD_STUDIO=OFF",
+        "-DPS2X_BUILD_TEST=OFF",
+        "-DPS2X_BUILD_RECOMP=OFF",
+        "-DPS2X_BUILD_ANALYZER=OFF"
+      ],
+      "windows": {
+        "args": [
+          "-S", "build/runtime-source-windows",
+          "-B", "build/runner-windows",
+          "-G", "Ninja",
+          "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+          "-DPS2X_BUILD_STUDIO=OFF",
+          "-DPS2X_BUILD_TEST=OFF",
+          "-DPS2X_BUILD_RECOMP=OFF",
+          "-DPS2X_BUILD_ANALYZER=OFF"
+        ]
+      },
+      "osx": {
+        "args": [
+          "-S", "build/runtime-source-macos",
+          "-B", "build/runner-macos",
+          "-G", "Ninja",
+          "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+          "-DPS2X_BUILD_STUDIO=OFF",
+          "-DPS2X_BUILD_TEST=OFF",
+          "-DPS2X_BUILD_RECOMP=OFF",
+          "-DPS2X_BUILD_ANALYZER=OFF"
+        ]
+      },
+      "problemMatcher": [],
+      "detail": "Configure the staged runtime. Prints the memory-aware compile/link job counts."
+    },
+    {
+      "label": "pipeline: 6 build runner",
+      "type": "process",
+      "command": "cmake",
+      "args": ["--build", "build/runner-linux", "--target", "ps2EntryRunner"],
+      "windows": { "args": ["--build", "build/runner-windows", "--target", "ps2EntryRunner"] },
+      "osx": { "args": ["--build", "build/runner-macos", "--target", "ps2EntryRunner"] },
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"],
+      "detail": "Build ps2EntryRunner. Concurrency is capped from host RAM by the job pools."
+    },
+    {
+      "label": "pipeline: full rebuild from ELF",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "pipeline: 1 merge function config",
+        "pipeline: 2 report function coverage",
+        "pipeline: 3 recompile game",
+        "pipeline: 4 stage generated runtime",
+        "pipeline: 5 configure runner",
+        "pipeline: 6 build runner"
+      ],
+      "problemMatcher": [],
+      "detail": "Run the whole reproducible pipeline in order. This takes a long time."
+    }
+  ]
+}

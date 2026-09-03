@@ -1,13 +1,88 @@
 # Project Status
 
-Last updated: 2026-09-01 (America/Chicago)
+Last updated: 2026-09-02 (America/Chicago)
 
 ## Current phase
 
 Phase 4 — IOP, storage, input, audio, and movies. Phase 3 completed on
-2026-08-27. Phase 0 exit criteria are complete; the Windows portions of Phase 1
-build and test, while Linux/macOS CI verification remains open as a carried
-platform task.
+2026-08-27. Phase 0 exit criteria are complete. Phase 1 now builds on Windows
+and Linux x86-64; macOS arm64 remains an unverified carried platform task.
+
+### Phase 4 first Linux x86-64 pipeline and runner build (2026-09-02)
+
+The whole reproducible pipeline ran end to end on Linux x86-64 (CachyOS,
+GCC 16.2.1, Python 3.14.7) against a user-supplied disc dump, producing a
+linked `ps2EntryRunner` for the first time on a non-Windows host. The runner
+has **not** been executed; reaching a linked binary is not evidence of
+guest-visible correctness.
+
+Verified build identity. The user's ISO SHA-256 is
+`3f8c658eee1b35147672c597c0dbe8e36552172abf83571c52753eec9a50bcca`, matching
+`config/game.toml`. Extraction to the ignored `Haunting Ground (USA)/` gives
+`SLUS_210.75` with SHA-256
+`3b374d53a499d2c17b205274ee9eb34280768f294f970ebf6ae6731f6a2dacb8` and
+`MODULES/SNDDRV.IRX` with SHA-256
+`3B8E76B6FCAA1B3FBE59848A6094BD230D5FE9643496E3AFF5F3B969730404BF`, both
+matching the recorded identities. `SYSTEM.CNF` reads `VER = 1.01`,
+`VMODE = NTSC`. `DATA.CVM` is 1,577,156,608 bytes (0x5E018000), the size the
+game-scoped CD-search service expects.
+
+Pipeline results: the merger validated 3,865 analysis and 7,200 manual
+functions; `report_function_coverage.py` reported 11,065 functions, 70.3441%
+executable-byte coverage, 0 overlaps, 0 uncovered direct targets and 0
+uncovered direct call targets, exiting 0; recompilation completed successfully
+into 11,068 files; staging installed 11,066 generated sources (206,331,733
+bytes).
+
+Four portability and build defects were found and fixed:
+
+- The pinned runtime did not compile on Linux at all. `ps2_runtime_macros.h`
+  calls SSE4.1 intrinsics that MSVC exposes unconditionally but GCC and Clang
+  reject as "inlining failed ... target specific option mismatch" without an
+  explicit ISA flag. `ps2_runtime.cpp`, `ps2_memory.cpp` and `ps2_iop_host.cpp`
+  all failed. PS2Recomp now enables SSE4.1 for non-MSVC x86 after probing the
+  flag; SSE4.1 is the exact baseline, with no AVX or SSE4.2 intrinsics in the
+  tree.
+- CI could not have caught that: the workflow built only the portable skeleton
+  and never the pinned runtime. A Linux job now compiles `ps2_runtime`,
+  `ps2_recomp`, `ps2_analyzer` and `ps2x_tests`. It deliberately does not run
+  the suite, which needs the generated recompilation of a user-supplied ELF.
+- `ctest` failed on every platform, not just Linux. `function_config_tests` ran
+  `unittest discover` from the build directory, so the tests could not
+  `import tools`. The test now sets `WORKING_DIRECTORY` to the source root;
+  ctest passes 2/2.
+- `stage_generated_runtime.py --incremental` silently never delivered authored
+  pinned-source corrections, refreshing only generated runner sources and the
+  two generated headers. Authored runtime and CMake fixes therefore could not
+  reach a staged build, contradicting the documented staging contract. The tool
+  now content-syncs pinned sources and prunes upstream-removed files, with
+  generated code, the two generated headers and this tool's own IOP-profile
+  insertions protected, and pruning confined to the pinned tree's top-level
+  directories so `mc0`/`imgui.ini` are never deletion candidates. Six tests
+  cover the behavior.
+
+Two build-resource fixes were also required. `register_functions.cpp` is a
+single generated function of about 41 MB; inside a unity batch under `-O2` it
+consumed over one hour and forty minutes of a single core while producing no
+hot code, and it now builds at `-O0 -g0` outside the unity batches. Generated
+unity translation units were measured peaking above 3 GiB of compiler RSS,
+which drove a 16 GiB host into swap under a core-count `-j`, so
+`ps2EntryRunner` compile concurrency is now sized from host RAM with a
+single-slot link pool. An optional ccache/sccache launcher was added, carrying
+the sloppiness settings the precompiled-header path needs.
+
+Open Linux blocker: `ps2x_tests` reports 478/488 with the pinned runtime built
+from the canonical tree. Nine failures are expected in that configuration
+because the Haunting Ground IOP profile was not staged. The tenth is not
+explained by staging and is a genuine finding: `VBlank remains host paced while
+guest code stays runnable` fails reproducibly on an idle machine across three
+runs. It exercises only the portable scheduler, with no game profile involved,
+and asserts a 100 ms wall-clock deadline on `vsyncTick`. This is unresolved and
+untriaged.
+
+The next executable action is to triage that VBlank pacing failure against a
+Windows run of the same test, then perform a first cold-boot execution of the
+Linux `ps2EntryRunner` and record what it reaches.
 
 ### Phase 4 v163 GS dirty-range synchronization prototype (2026-09-01)
 

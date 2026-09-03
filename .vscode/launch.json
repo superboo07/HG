@@ -1,0 +1,141 @@
+{
+  // The guest ELF is argv[1]. The runtime derives cdrom0: from that ELF's own
+  // directory, so pointing at the extracted dump also resolves DATA.CVM and
+  // MODULES/ with no further configuration.
+  //
+  // The user must supply their own legally obtained game data; the dump
+  // directory is ignored by git and is never part of this repository.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run: Haunting Ground (no debugger)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/runner-linux/ps2xRuntime/ps2EntryRunner",
+      "windows": {
+        "program": "${workspaceFolder}/build/runner-windows/ps2xRuntime/ps2EntryRunner.exe"
+      },
+      "osx": {
+        "program": "${workspaceFolder}/build/runner-macos/ps2xRuntime/ps2EntryRunner",
+        "MIMode": "lldb"
+      },
+      "args": ["Haunting Ground (USA)/SLUS_210.75"],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "noDebug": true,
+      "preLaunchTask": "pipeline: 6 build runner"
+    },
+    {
+      "name": "Debug: Haunting Ground",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/runner-linux/ps2xRuntime/ps2EntryRunner",
+      "windows": {
+        "program": "${workspaceFolder}/build/runner-windows/ps2xRuntime/ps2EntryRunner.exe",
+        "type": "cppvsdbg"
+      },
+      "osx": {
+        "program": "${workspaceFolder}/build/runner-macos/ps2xRuntime/ps2EntryRunner",
+        "MIMode": "lldb"
+      },
+      "args": ["Haunting Ground (USA)/SLUS_210.75"],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing for gdb",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        },
+        {
+          "description": "The runner links a very large generated binary; do not stop on SIGPWR/SIGXCPU used by some allocators",
+          "text": "handle SIGPWR nostop noprint pass",
+          "ignoreFailures": true
+        }
+      ],
+      "preLaunchTask": "pipeline: 6 build runner"
+    },
+    {
+      "name": "Debug: Haunting Ground (CPU GS backend)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/runner-linux/ps2xRuntime/ps2EntryRunner",
+      "osx": {
+        "program": "${workspaceFolder}/build/runner-macos/ps2xRuntime/ps2EntryRunner",
+        "MIMode": "lldb"
+      },
+      "args": ["Haunting Ground (USA)/SLUS_210.75"],
+      "cwd": "${workspaceFolder}",
+      "environment": [{ "name": "PS2X_DISABLE_OPENGL_GS", "value": "1" }],
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing for gdb",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "Debug: skeleton runner (hg_runner)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/linux-ninja/hg_runner",
+      "windows": {
+        "program": "${workspaceFolder}/build/windows-msvc/Debug/hg_runner.exe",
+        "type": "cppvsdbg"
+      },
+      "osx": {
+        "program": "${workspaceFolder}/build/macos-ninja/hg_runner",
+        "MIMode": "lldb"
+      },
+      "args": ["--version"],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "preLaunchTask": "cmake: build skeleton runner"
+    },
+    {
+      "name": "Debug: ps2_recomp (recompiler)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/linux-ninja/ps2recomp/ps2xRecomp/ps2_recomp",
+      "windows": {
+        "program": "${workspaceFolder}/build/windows-msvc/ps2recomp/ps2xRecomp/Debug/ps2_recomp.exe",
+        "type": "cppvsdbg"
+      },
+      "osx": {
+        "program": "${workspaceFolder}/build/macos-ninja/ps2recomp/ps2xRecomp/ps2_recomp",
+        "MIMode": "lldb"
+      },
+      "args": ["build/generated/recomp.effective.toml"],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing for gdb",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "Debug: current Python tool",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}
