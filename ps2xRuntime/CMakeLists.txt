@@ -486,6 +486,78 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
     )
 endif()
 
+# register_functions.cpp is one generated function that registers every
+# recompiled entry point.  For a full game map it is tens of megabytes of
+# straight-line table population, and the optimizer's per-function passes scale
+# superlinearly on a body that size: it measurably dominates the whole runner
+# build while producing no hot code.  Compile it unoptimized and keep it out of
+# the unity batches, since a batched file cannot carry its own flags.
+set(PS2X_REGISTER_FUNCTIONS_CPP
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/register_functions.cpp")
+if(EXISTS "${PS2X_REGISTER_FUNCTIONS_CPP}")
+    if(MSVC)
+        set(PS2X_REGISTER_FUNCTIONS_OPTIONS "/Od")
+    else()
+        # -g0 as well: debug info for a generated registration table is useless
+        # and at this file size it dominates object size and link time.
+        set(PS2X_REGISTER_FUNCTIONS_OPTIONS "-O0;-g0")
+    endif()
+    set_source_files_properties("${PS2X_REGISTER_FUNCTIONS_CPP}"
+        DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        PROPERTIES
+            SKIP_UNITY_BUILD_INCLUSION TRUE
+            COMPILE_OPTIONS "${PS2X_REGISTER_FUNCTIONS_OPTIONS}"
+    )
+endif()
+
+# Memory-aware build concurrency.
+#
+# The generated runner's unity translation units are the largest in the project
+# and have been measured peaking above 3 GiB of compiler RSS each.  Ninja's -j
+# only counts jobs, not memory, so a core-count default can drive a normal
+# desktop into swap or the OOM killer.  Ninja has no RAM governor of its own, so
+# size a dedicated job pool from host memory at configure time instead, and give
+# linking its own single-slot pool because the final link is the largest single
+# allocation in the build.  Override the estimates below on unusual hosts, or
+# pass a smaller "--parallel"/"-j" for a one-off build.
+option(PS2X_ENABLE_MEMORY_AWARE_JOB_POOLS
+    "Size ps2EntryRunner compile/link concurrency from host RAM" ON)
+set(PS2X_RUNNER_COMPILE_PEAK_MB "3200" CACHE STRING
+    "Assumed peak compiler RSS per generated-runner translation unit, in MiB")
+set(PS2X_RUNNER_MEMORY_RESERVE_MB "2048" CACHE STRING
+    "Host memory left for the OS and other applications during the build, in MiB")
+
+if(PS2X_ENABLE_MEMORY_AWARE_JOB_POOLS AND CMAKE_GENERATOR MATCHES "Ninja")
+    cmake_host_system_information(RESULT PS2X_HOST_CORES
+        QUERY NUMBER_OF_LOGICAL_CORES)
+    cmake_host_system_information(RESULT PS2X_HOST_RAM_MB
+        QUERY TOTAL_PHYSICAL_MEMORY)
+
+    math(EXPR PS2X_USABLE_RAM_MB
+        "${PS2X_HOST_RAM_MB} - ${PS2X_RUNNER_MEMORY_RESERVE_MB}")
+    if(PS2X_USABLE_RAM_MB LESS PS2X_RUNNER_COMPILE_PEAK_MB)
+        set(PS2X_RUNNER_COMPILE_JOBS 1)
+    else()
+        math(EXPR PS2X_RUNNER_COMPILE_JOBS
+            "${PS2X_USABLE_RAM_MB} / ${PS2X_RUNNER_COMPILE_PEAK_MB}")
+    endif()
+    if(PS2X_RUNNER_COMPILE_JOBS GREATER PS2X_HOST_CORES)
+        set(PS2X_RUNNER_COMPILE_JOBS "${PS2X_HOST_CORES}")
+    endif()
+
+    set_property(GLOBAL PROPERTY JOB_POOLS
+        ps2x_runner_compile=${PS2X_RUNNER_COMPILE_JOBS}
+        ps2x_runner_link=1)
+    set_target_properties(ps2EntryRunner PROPERTIES
+        JOB_POOL_COMPILE ps2x_runner_compile
+        JOB_POOL_LINK ps2x_runner_link)
+
+    message(STATUS
+        "ps2EntryRunner concurrency: ${PS2X_RUNNER_COMPILE_JOBS} compile job(s), 1 link job "
+        "(${PS2X_HOST_RAM_MB} MiB RAM, ${PS2X_HOST_CORES} cores, "
+        "${PS2X_RUNNER_COMPILE_PEAK_MB} MiB/TU estimate)")
+endif()
+
 if(PS2X_ENABLE_RUNNER_PCH)
     set(PS2X_RUNNER_PCH_HEADERS
         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime_macros.h"
